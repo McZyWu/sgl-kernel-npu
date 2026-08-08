@@ -4,6 +4,11 @@ import triton.language as tl
 
 from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
+# Keep these identical to the score + combine pipeline. Both constants affect
+# the FP32 reduction tree and can change the final BF16 mixture.
+_BLOCK_H = 32
+_MAX_ROWS = 16
+
 
 @triton.jit(do_not_specialize=["N", "B"])
 def _mix_fused_kernel(
@@ -20,7 +25,8 @@ def _mix_fused_kernel(
     H: tl.constexpr,
     EPS: tl.constexpr,
     NUM_CORES: tl.constexpr,
-    NB: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
 ):
     block_size = (N - 1) // NUM_CORES + 1
     pid = tl.program_id(0)
@@ -29,29 +35,44 @@ def _mix_fused_kernel(
         return
     token_end = tl.minimum(token_start + block_size, N)
 
-    hidden_offsets = tl.arange(0, H)
-    row_offsets = tl.arange(0, NB)
-    combined_weight = tl.load(cw_ptr + hidden_offsets).to(tl.float32)
+    row_offsets = tl.arange(0, MAX_ROWS)
 
     for token in range(token_start, token_end):
-        scores = tl.full([NB], -float("inf"), dtype=tl.float32)
+        scores = tl.full([MAX_ROWS], -float("inf"), dtype=tl.float32)
         for row in range(B + 1):
-            if row < B:
-                value = tl.load(
-                    bank_ptr + token * stride_bm + row * stride_bb + hidden_offsets
-                ).to(tl.float32)
-            else:
-                value = tl.load(prefix_ptr + token * stride_pm + hidden_offsets).to(
-                    tl.float32
-                )
-            inverse_rms = tl.rsqrt(tl.sum(value * value) / H + EPS)
-            score = tl.sum(value * inverse_rms * combined_weight)
+            squared_sum = 0.0
+            dot = 0.0
+            for hidden_start in tl.range(
+                0,
+                H,
+                BLOCK_H,
+                loop_unroll_factor=1,
+                disallow_acc_multi_buffer=True,
+            ):
+                hidden_offsets = hidden_start + tl.arange(0, BLOCK_H)
+                if row < B:
+                    value = tl.load(
+                        bank_ptr
+                        + token * stride_bm
+                        + row * stride_bb
+                        + hidden_offsets
+                    ).to(tl.float32)
+                else:
+                    value = tl.load(
+                        prefix_ptr + token * stride_pm + hidden_offsets
+                    ).to(tl.float32)
+                combined_weight = tl.load(cw_ptr + hidden_offsets)
+                squared_sum += tl.sum(value * value)
+                dot += tl.sum(value * combined_weight)
+            inverse_rms = 1.0 / tl.sqrt(squared_sum / H + EPS)
+            score = dot * inverse_rms
             scores = tl.where(row_offsets == row, score, scores)
 
         scores_max = tl.max(scores)
         exp_scores = tl.exp(scores - scores_max)
         probabilities = exp_scores / tl.sum(exp_scores)
 
+        hidden_offsets = tl.arange(0, H)
         output = tl.zeros([H], dtype=tl.float32)
         for row in range(B + 1):
             if row < B:
@@ -89,6 +110,10 @@ def mix_fused(
         return prefix_sum
     if not 0 <= num_valid_blocks <= bank.shape[1]:
         raise ValueError("num_valid_blocks must fit within the residual bank")
+    if num_valid_blocks >= _MAX_ROWS:
+        raise ValueError(f"num_valid_blocks must be less than {_MAX_ROWS}")
+    if hidden_size % _BLOCK_H:
+        raise ValueError(f"hidden size {hidden_size} must be divisible by {_BLOCK_H}")
 
     output = torch.empty_like(prefix_sum)
     _, num_vector_cores = get_device_properties()
@@ -106,7 +131,8 @@ def mix_fused(
         H=hidden_size,
         EPS=variance_epsilon,
         NUM_CORES=num_vector_cores,
-        NB=triton.next_power_of_2(num_valid_blocks + 1),
+        BLOCK_H=_BLOCK_H,
+        MAX_ROWS=_MAX_ROWS,
         multibuffer=True,
     )
     return output
