@@ -9,7 +9,7 @@ import triton.language as tl
     configs=[triton.Config({"BT": bt}) for bt in (32, 64, 128)],
     key=["H", "D"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _kda_gate_fwd_kernel(
     g,
     A,

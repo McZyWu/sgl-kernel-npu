@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["logical_grid"])
 def _speculative_state_scatter_kernel(
     dst_ptr,
     src_ptr,
@@ -22,16 +22,16 @@ def _speculative_state_scatter_kernel(
     src_tail_stride_1,
     src_tail_stride_2,
     tail_numel,
+    logical_grid,
     TAIL_DIM_1: tl.constexpr,
     TAIL_DIM_2: tl.constexpr,
-    LOGICAL_GRID: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
     TAIL_GRID: tl.constexpr,
     BLOCK: tl.constexpr,
     PHYSICAL_GRID: tl.constexpr,
 ):
     physical_pid = tl.program_id(0)
-    for logical_pid in range(physical_pid, LOGICAL_GRID, PHYSICAL_GRID):
+    for logical_pid in tl.range(physical_pid, logical_grid, PHYSICAL_GRID):
         tail_pid = logical_pid % TAIL_GRID
         layer_pid = (logical_pid // TAIL_GRID) % NUM_LAYERS
         request_pid = logical_pid // (TAIL_GRID * NUM_LAYERS)
@@ -113,7 +113,7 @@ def speculative_state_scatter_npu(
     block = min(1024, triton.next_power_of_2(tail_numel))
     tail_grid = triton.cdiv(tail_numel, block)
     logical_grid = num_requests * dst.shape[0] * tail_grid
-    physical_grid = min(48, logical_grid)
+    physical_grid = 48
 
     _speculative_state_scatter_kernel[(physical_grid,)](
         dst,
@@ -129,9 +129,9 @@ def speculative_state_scatter_npu(
         *dst_tail_strides,
         *src_tail_strides,
         tail_numel,
+        logical_grid,
         TAIL_DIM_1=padded_tail_shape[1],
         TAIL_DIM_2=padded_tail_shape[2],
-        LOGICAL_GRID=logical_grid,
         NUM_LAYERS=dst.shape[0],
         TAIL_GRID=tail_grid,
         BLOCK=block,
