@@ -8,11 +8,7 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import triton.runtime.driver as driver
 from sgl_kernel_npu.fla.utils import input_guard
-from sgl_kernel_npu.utils.triton_utils import get_device_properties
-
-BT_LIST = [8, 16, 32, 64, 128]
 
 
 @triton.jit
@@ -38,36 +34,37 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-@triton.jit
-def l2norm_fwd_kernel_opt(
+@triton.jit(do_not_specialize=["T"])
+def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB,
     T,
-    D,
-    MBS,
+    D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
     i_t = tl.program_id(0)
-    num_sub_blocks = tl.cdiv(MBS, BT)
-    base_offset = i_t * MBS
-
-    for sub_block_idx in range(num_sub_blocks):
-        sub_offset = base_offset + sub_block_idx * BT
-
-        p_x = tl.make_block_ptr(x, (T, D), (D, 1), (sub_offset, 0), (BT, BD), (1, 0))
-        b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-        b_var = tl.sum(b_x * b_x, axis=1)
-        b_y = b_x * tl.rsqrt(b_var + eps)[:, None]
-        p_y = tl.make_block_ptr(y, (T, D), (D, 1), (sub_offset, 0), (BT, BD), (1, 0))
-        tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
-
-
-def get_npu_properties():
-    device = torch.npu.current_device()
-    return driver.active.utils.get_device_properties(device)
+    p_x = tl.make_block_ptr(
+        x,
+        (T, D),
+        (D, 1),
+        (i_t * BT, 0),
+        (BT, BD),
+        (1, 0),
+    )
+    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    p_y = tl.make_block_ptr(
+        y,
+        (T, D),
+        (D, 1),
+        (i_t * BT, 0),
+        (BT, BD),
+        (1, 0),
+    )
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
 def l2norm_fwd(
@@ -91,23 +88,18 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
-
-        bt = 109
-        num_core = get_device_properties()[1]
-        main_bs = triton.cdiv(T, num_core)
-        grid = (num_core,)
-
-        l2norm_fwd_kernel_opt[grid](
+        # Keep the NPU-tuned row tile while assigning each row to exactly one
+        # program. The previous core-persistent schedule launched overlapping
+        # tiles whenever its per-core row count was not divisible by BT.
+        BT = 109
+        l2norm_fwd_kernel[(triton.cdiv(T, BT),)](
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
-            MBS=main_bs,
             BD=BD,
-            BT=bt,
+            BT=BT,
             num_warps=8,
             num_stages=3,
         )
