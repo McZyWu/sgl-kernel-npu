@@ -26,9 +26,7 @@ def _select_global_top1_kernel(
         other=VOCAB_SIZE,
     ).to(tl.int32)
     best_value = tl.max(values, axis=0)
-    best_token = tl.min(
-        tl.where(values == best_value, token_ids, VOCAB_SIZE), axis=0
-    )
+    best_token = tl.min(tl.where(values == best_value, token_ids, VOCAB_SIZE), axis=0)
     tl.store(output_ptr + row, best_token.to(tl.int64))
 
 
