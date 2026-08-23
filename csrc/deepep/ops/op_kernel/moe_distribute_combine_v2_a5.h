@@ -1200,7 +1200,7 @@ __aicore__ inline void MoeDistributeCombineV2A5<TemplateMC2TypeFunc>::ProcessExp
 
     if ((zeroExpertNum_ + copyExpertNum_ + constExpertNum_) == 0U) {
         if constexpr (IsInt8Quant) {
-            if ((activeMaskBsCnt_ == 1U) && (axisH_ == 3584U) && (axisK_ == 16U) && !isInputExpertMaskFlag_) {
+            if ((activeMaskBsCnt_ == 16U) && (axisH_ == 3584U) && (axisK_ == 16U) && !isInputExpertMaskFlag_) {
                 ProcessMoeExpertsPipelined(tokenIndexOffset, index);
                 index += axisK_;
             } else {
