@@ -150,3 +150,31 @@ def test_move_intermediate_cache(
     move_intermediate_cache(dst_cache_clone, src_cache, valid_tensor, last_steps_tensor)
 
     assert_close("move_cache", dst_cache, dst_cache_clone, 1e-3)
+
+
+@pytest.mark.parametrize("V", [65, 128, 129])
+@torch.no_grad
+def test_move_intermediate_cache_strided_destination(V: int):
+    torch.manual_seed(42)
+    L, S, D, H, K = 2, 5, 3, 3, 17
+
+    dst_ref_storage = torch.randn(
+        L, H, V, K, S, device=device, dtype=torch.bfloat16
+    )
+    dst_storage = dst_ref_storage.clone()
+    dst_ref = dst_ref_storage.permute(0, 4, 1, 2, 3)
+    dst_cache = dst_storage.permute(0, 4, 1, 2, 3)
+    src_cache = torch.randn(
+        L, S, D, H, V, K, device=device, dtype=torch.bfloat16
+    )
+    valid_tensor = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    last_steps_tensor = torch.tensor([0, 2], device=device, dtype=torch.int32)
+    valid_indices = valid_tensor.to(torch.int64)
+    last_steps = last_steps_tensor.to(torch.int64)
+
+    assert not dst_cache.is_contiguous()
+    dst_ref[:, valid_indices] = src_cache[:, valid_indices, last_steps]
+
+    move_intermediate_cache(dst_cache, src_cache, valid_tensor, last_steps_tensor)
+
+    assert torch.equal(dst_ref, dst_cache)

@@ -28,6 +28,9 @@ def move_cache_dynamic_last_kernel_h_block(
     draft_stride,
     dst_layer_stride,
     dst_size_stride,
+    dst_h_stride,
+    dst_v_stride,
+    dst_k_stride,
     h_dim,
     dim_v,
     dim_k,
@@ -44,7 +47,6 @@ def move_cache_dynamic_last_kernel_h_block(
     if last_step_val < 0:
         return
     h_offsets = tl.arange(0, H_BLOCK_SIZE)
-    v_offsets = tl.arange(0, BLOCK_V)
     k_offsets = tl.arange(0, BLOCK_K)
 
     # Process each layer
@@ -66,19 +68,30 @@ def move_cache_dynamic_last_kernel_h_block(
             h_real = h_start + h_offsets
             h_mask = h_real < h_dim
 
-            v_mask = v_offsets < dim_v
-            k_mask = k_offsets < dim_k
+            for v_start in range(0, dim_v, BLOCK_V):
+                v_real = v_start + tl.arange(0, BLOCK_V)
+                v_mask = v_real < dim_v
+                k_mask = k_offsets < dim_k
 
-            mask = h_mask[:, None, None] & v_mask[None, :, None] & k_mask[None, None, :]
+                mask = (
+                    h_mask[:, None, None]
+                    & v_mask[None, :, None]
+                    & k_mask[None, None, :]
+                )
 
-            linear_offset = (
-                h_real[:, None, None] * dim_v * dim_k
-                + v_offsets[None, :, None] * dim_k
-                + k_offsets[None, None, :]
-            )
+                src_offset = (
+                    h_real[:, None, None] * dim_v * dim_k
+                    + v_real[None, :, None] * dim_k
+                    + k_offsets[None, None, :]
+                )
+                dst_offset = (
+                    h_real[:, None, None] * dst_h_stride
+                    + v_real[None, :, None] * dst_v_stride
+                    + k_offsets[None, None, :] * dst_k_stride
+                )
 
-            src_block = tl.load(src_addr + linear_offset, mask=mask, other=0)
-            tl.store(dst_base_addr + linear_offset, src_block, mask=mask)
+                src_block = tl.load(src_addr + src_offset, mask=mask, other=0)
+                tl.store(dst_base_addr + dst_offset, src_block, mask=mask)
 
 
 def move_intermediate_cache(
@@ -86,7 +99,7 @@ def move_intermediate_cache(
     intermediate_state_cache,
     valid_tensor,
     last_steps_tensor,
-    h_block_size=2,
+    h_block_size=1,
 ):
     """
     Move intermediate cache to SSM states using Triton kernel.
@@ -106,10 +119,13 @@ def move_intermediate_cache(
         int(strides[1]),
         int(strides[2]),
     )
-    dst_layer_stride, dst_size_stride = int(ssm_states.stride()[0]), int(
-        ssm_states.stride()[1]
-    )
+    dst_strides = ssm_states.stride()
+    dst_layer_stride, dst_size_stride = int(dst_strides[0]), int(dst_strides[1])
+    dst_h_stride, dst_v_stride, dst_k_stride = map(int, dst_strides[2:5])
     assert len(valid_tensor) == len(last_steps_tensor), "Lengths must match"
+
+    if len(valid_tensor) == 0:
+        return ssm_states
 
     # Grid: one thread per valid index
     grid = (len(valid_tensor),)
@@ -124,12 +140,15 @@ def move_intermediate_cache(
         draft_stride=draft_stride,
         dst_layer_stride=dst_layer_stride,
         dst_size_stride=dst_size_stride,
+        dst_h_stride=dst_h_stride,
+        dst_v_stride=dst_v_stride,
+        dst_k_stride=dst_k_stride,
         h_dim=H,
         dim_v=V,
         dim_k=K,
         num_layers=L,
-        H_BLOCK_SIZE=h_block_size,  # Process 2 h elements per block
-        BLOCK_V=triton.next_power_of_2(V),  # Block size for dim_v
+        H_BLOCK_SIZE=h_block_size,
+        BLOCK_V=64,
         BLOCK_K=triton.next_power_of_2(K),  # Block size for dim_k
     )
 
