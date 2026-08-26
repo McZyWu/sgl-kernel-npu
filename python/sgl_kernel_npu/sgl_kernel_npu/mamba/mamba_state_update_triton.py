@@ -28,9 +28,9 @@ def move_cache_dynamic_last_kernel_h_block(
     draft_stride,
     dst_layer_stride,
     dst_size_stride,
-    dst_h_stride,
-    dst_v_stride,
-    dst_k_stride,
+    num_src_slots,
+    num_dst_slots,
+    num_drafts,
     h_dim,
     dim_v,
     dim_k,
@@ -44,7 +44,15 @@ def move_cache_dynamic_last_kernel_h_block(
     # Load actual indices
     valid_idx_val = tl.load(valid_indices_ptr + valid_id)
     last_step_val = tl.load(last_steps_ptr + valid_id)
+    if valid_idx_val < 0:
+        return
+    if valid_idx_val >= num_src_slots:
+        return
+    if valid_idx_val >= num_dst_slots:
+        return
     if last_step_val < 0:
+        return
+    if last_step_val >= num_drafts:
         return
     h_offsets = tl.arange(0, H_BLOCK_SIZE)
     k_offsets = tl.arange(0, BLOCK_K)
@@ -79,19 +87,18 @@ def move_cache_dynamic_last_kernel_h_block(
                     & k_mask[None, None, :]
                 )
 
-                src_offset = (
+                linear_offset = (
                     h_real[:, None, None] * dim_v * dim_k
                     + v_real[None, :, None] * dim_k
                     + k_offsets[None, None, :]
                 )
-                dst_offset = (
-                    h_real[:, None, None] * dst_h_stride
-                    + v_real[None, :, None] * dst_v_stride
-                    + k_offsets[None, None, :] * dst_k_stride
-                )
 
-                src_block = tl.load(src_addr + src_offset, mask=mask, other=0)
-                tl.store(dst_base_addr + dst_offset, src_block, mask=mask)
+                src_block = tl.load(src_addr + linear_offset, mask=mask, other=0)
+                # recurrent_gated_delta_rule consumes recurrent_state through a
+                # raw data_ptr without tensor strides. Keep the physical dense
+                # slot layout instead of applying the destination view's
+                # logical H/V/K permutation a second time.
+                tl.store(dst_base_addr + linear_offset, src_block, mask=mask)
 
 
 def move_intermediate_cache(
@@ -105,13 +112,60 @@ def move_intermediate_cache(
     Move intermediate cache to SSM states using Triton kernel.
 
     Args:
-        ssm_states: Destination SSM states tensor
-        intermediate_state_cache: Source intermediate state cache
+        ssm_states: Destination SSM states tensor. Its per-slot backing storage
+            must be dense, but its logical H/V/K view may be a permutation.
+        intermediate_state_cache: Source intermediate state cache. The final
+            H/V/K dimensions must be contiguous in that order.
         valid_tensor: Valid indices tensor
         last_steps_tensor: Last steps tensor
         h_block_size: Block size for h dimension processing
     """
+    if intermediate_state_cache.ndim != 6:
+        raise ValueError(
+            "intermediate_state_cache must be 6D [L, S, D, H, V, K], "
+            f"got {intermediate_state_cache.ndim}D"
+        )
+    if ssm_states.ndim != 5:
+        raise ValueError(
+            f"ssm_states must be 5D [L, S, H, V, K], got {ssm_states.ndim}D"
+        )
+    if valid_tensor.ndim != 1 or last_steps_tensor.ndim != 1:
+        raise ValueError("valid_tensor and last_steps_tensor must be 1D")
+    if (
+        valid_tensor.device != ssm_states.device
+        or last_steps_tensor.device != ssm_states.device
+    ):
+        raise ValueError("all cache and index tensors must be on the same device")
+    if intermediate_state_cache.device != ssm_states.device:
+        raise ValueError("all cache and index tensors must be on the same device")
+    if ssm_states.dtype != intermediate_state_cache.dtype:
+        raise ValueError(
+            "source and destination cache dtypes must match, "
+            f"got {intermediate_state_cache.dtype} and {ssm_states.dtype}"
+        )
+    for name, tensor in (
+        ("valid_tensor", valid_tensor),
+        ("last_steps_tensor", last_steps_tensor),
+    ):
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must use int32 or int64, got {tensor.dtype}")
+
     L, S, D, H, V, K = intermediate_state_cache.shape
+    if min(L, S, D, H, V, K) <= 0:
+        raise ValueError("cache dimensions must all be positive")
+    if ssm_states.shape[0] != L:
+        raise ValueError(
+            "source and destination layer counts must match, "
+            f"got {L} and {ssm_states.shape[0]}"
+        )
+
+    inner_numel = H * V * K
+    dst_inner_numel = ssm_states.shape[2] * ssm_states.shape[3] * ssm_states.shape[4]
+    if dst_inner_numel != inner_numel:
+        raise ValueError(
+            "source and destination state sizes must match, "
+            f"got {inner_numel} and {dst_inner_numel} elements per slot"
+        )
 
     strides = intermediate_state_cache.stride()
     layer_stride, size_stride, draft_stride = (
@@ -119,13 +173,50 @@ def move_intermediate_cache(
         int(strides[1]),
         int(strides[2]),
     )
+    expected_src_inner_strides = (V * K, K, 1)
+    src_inner_strides = tuple(map(int, strides[3:6]))
+    if src_inner_strides != expected_src_inner_strides:
+        raise ValueError(
+            "intermediate_state_cache H/V/K dimensions must be contiguous; "
+            f"expected strides {expected_src_inner_strides}, got {src_inner_strides}"
+        )
+
     dst_strides = ssm_states.stride()
     dst_layer_stride, dst_size_stride = int(dst_strides[0]), int(dst_strides[1])
-    dst_h_stride, dst_v_stride, dst_k_stride = map(int, dst_strides[2:5])
-    assert len(valid_tensor) == len(last_steps_tensor), "Lengths must match"
+
+    # The NPU recurrent GDN op ignores tensor strides and consumes each state
+    # slot through a raw dense pointer. Dense inner permutations are valid ABI
+    # shims, while views with holes or overlapping elements are unsafe.
+    dense_stride = 1
+    for stride, size in sorted(
+        zip(map(int, dst_strides[2:5]), map(int, ssm_states.shape[2:5]))
+    ):
+        if size > 1:
+            if stride != dense_stride:
+                raise ValueError(
+                    "ssm_states must have dense per-slot backing storage; "
+                    f"got inner shape {tuple(ssm_states.shape[2:5])} and "
+                    f"strides {tuple(dst_strides[2:5])}"
+                )
+            dense_stride *= size
+    if dst_size_stride < inner_numel:
+        raise ValueError(
+            "ssm_states slot stride is too small for one dense state block"
+        )
+    if dst_layer_stride < ssm_states.shape[1] * dst_size_stride:
+        raise ValueError(
+            "ssm_states layer stride is too small for all destination slots"
+        )
+    if len(valid_tensor) != len(last_steps_tensor):
+        raise ValueError("valid indices and last steps lengths must match")
+    if h_block_size <= 0 or h_block_size & (h_block_size - 1):
+        raise ValueError("h_block_size must be a positive power of two")
 
     if len(valid_tensor) == 0:
         return ssm_states
+
+    valid_tensor = valid_tensor.contiguous()
+    last_steps_tensor = last_steps_tensor.contiguous()
 
     # Grid: one thread per valid index
     grid = (len(valid_tensor),)
@@ -140,9 +231,9 @@ def move_intermediate_cache(
         draft_stride=draft_stride,
         dst_layer_stride=dst_layer_stride,
         dst_size_stride=dst_size_stride,
-        dst_h_stride=dst_h_stride,
-        dst_v_stride=dst_v_stride,
-        dst_k_stride=dst_k_stride,
+        num_src_slots=S,
+        num_dst_slots=ssm_states.shape[1],
+        num_drafts=D,
         h_dim=H,
         dim_v=V,
         dim_k=K,
@@ -161,13 +252,15 @@ def _conv_state_rollback_kernel(
     state_indices_ptr,
     step_indices_ptr,
     draft_token_num,
+    num_slots,
     num_layers,
-    num_dims: tl.constexpr,
+    num_dims,
     conv_window_size: tl.constexpr,
     layer_stride: tl.constexpr,
     req_stride: tl.constexpr,
     window_stride: tl.constexpr,
     dim_stride: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
 ):
     """
     Triton kernel for rolling back conv states after MTP verification.
@@ -177,6 +270,7 @@ def _conv_state_rollback_kernel(
         state_indices_ptr: Pointer to state indices [num_requests]
         step_indices_ptr: Pointer to step indices (accepted steps) [num_requests]
         draft_token_num: Number of draft tokens
+        num_slots: Number of request slots in conv_states
         num_layers: Number of layers
         num_dims: Number of dimensions
         conv_window_size: Convolution window size
@@ -191,7 +285,13 @@ def _conv_state_rollback_kernel(
     state_idx = tl.load(state_indices_ptr + pid_req).to(tl.int64)
     step_idx = tl.load(step_indices_ptr + pid_req).to(tl.int64)
 
+    if state_idx < 0:
+        return
+    if state_idx >= num_slots:
+        return
     if step_idx < 0:
+        return
+    if step_idx >= draft_token_num:
         return
 
     # Calculate rollback shift
@@ -202,7 +302,8 @@ def _conv_state_rollback_kernel(
         return
 
     # Generate dimension offsets once
-    dim_offsets = tl.arange(0, num_dims)
+    dim_offsets = tl.arange(0, BLOCK_DIM)
+    dim_mask = dim_offsets < num_dims
 
     # Process each layer
     for layer in range(num_layers):
@@ -228,8 +329,8 @@ def _conv_state_rollback_kernel(
             dst_ptr = conv_states_ptr + dst_offset
 
             # Load and store all dimensions at once
-            data = tl.load(src_ptr)
-            tl.store(dst_ptr, data)
+            data = tl.load(src_ptr, mask=dim_mask)
+            tl.store(dst_ptr, data, mask=dim_mask)
 
 
 def conv_state_rollback(
@@ -247,50 +348,71 @@ def conv_state_rollback(
         step_indices: Accepted steps for each request [num_requests]
         draft_token_num: Number of draft tokens
     """
-    num_requests = state_indices.shape[0]
-    if num_requests == 0:
-        return
-
     if conv_states.ndim != 4:
         raise ValueError(f"conv_states must be 4D, got {conv_states.ndim}D")
     if state_indices.ndim != 1 or step_indices.ndim != 1:
         raise ValueError("state_indices and step_indices must be 1D")
     if state_indices.shape[0] != step_indices.shape[0]:
         raise ValueError("state_indices and step_indices must have the same length")
+    if (
+        state_indices.device != conv_states.device
+        or step_indices.device != conv_states.device
+    ):
+        raise ValueError("conv_states and index tensors must be on the same device")
+    for name, tensor in (
+        ("state_indices", state_indices),
+        ("step_indices", step_indices),
+    ):
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must use int32 or int64, got {tensor.dtype}")
+    if not isinstance(draft_token_num, int) or draft_token_num <= 0:
+        raise ValueError("draft_token_num must be a positive integer")
 
+    num_requests = state_indices.shape[0]
     num_layers = conv_states.shape[0]
+    num_slots = conv_states.shape[1]
     conv_window_size = conv_states.shape[2]
     num_dims = conv_states.shape[3]
+    if min(num_layers, num_slots, conv_window_size, num_dims) <= 0:
+        raise ValueError("conv_states dimensions must all be positive")
+    if draft_token_num > conv_window_size + 1:
+        raise ValueError(
+            "draft_token_num cannot exceed conv_window_size + 1, "
+            f"got {draft_token_num} and {conv_window_size}"
+        )
+    if num_requests == 0:
+        return conv_states
 
     # Get strides (in elements, not bytes)
     layer_stride = conv_states.stride(0)
     req_stride = conv_states.stride(1)
     window_stride = conv_states.stride(2)
     dim_stride = conv_states.stride(3)
+    if min(layer_stride, req_stride, window_stride, dim_stride) <= 0:
+        raise ValueError("conv_states must have positive strides")
 
-    # Ensure indices are int32 and contiguous
-    state_indices = state_indices.to(torch.int32).contiguous()
-    step_indices = step_indices.to(torch.int32).contiguous()
-
-    # Ensure conv_states is contiguous
-    if not conv_states.is_contiguous():
-        conv_states = conv_states.contiguous()
+    # Keep the caller's original view and update its backing state pool in
+    # place. The runtime ignores this helper's return value.
+    state_indices = state_indices.contiguous()
+    step_indices = step_indices.contiguous()
 
     # Grid over all requests
     grid = (num_requests,)
 
     _conv_state_rollback_kernel[grid](
-        conv_states,
-        state_indices,
-        step_indices,
-        draft_token_num,
-        num_layers,
-        num_dims,
-        conv_window_size,
-        layer_stride,
-        req_stride,
-        window_stride,
-        dim_stride,
+        conv_states_ptr=conv_states,
+        state_indices_ptr=state_indices,
+        step_indices_ptr=step_indices,
+        draft_token_num=draft_token_num,
+        num_slots=num_slots,
+        num_layers=num_layers,
+        num_dims=num_dims,
+        conv_window_size=conv_window_size,
+        layer_stride=layer_stride,
+        req_stride=req_stride,
+        window_stride=window_stride,
+        dim_stride=dim_stride,
+        BLOCK_DIM=triton.next_power_of_2(num_dims),
     )
 
     return conv_states
