@@ -156,27 +156,80 @@ def test_move_intermediate_cache(
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
-
+    # prepare input data
     dst_cache = torch.randn(L, S, H, V, K, device=device, dtype=dtype)
     dst_cache_clone = dst_cache.clone()
     src_cache = torch.randn(L, S, D, H, V, K, device=device, dtype=dtype)
 
+    # prepare input data
     population = range(S)
     valid_indices = random.sample(population, num_valid)
     last_step_pos = [random.randint(0, D - 1) for _ in range(num_valid)]
-
-    valid_tensor = torch.tensor(valid_indices, device=device, dtype=torch.int32)
+    dst_indices_tensor = torch.tensor(valid_indices, device=device, dtype=torch.int32)
+    src_indices_tensor = torch.arange(
+        dst_indices_tensor.shape[0], device=device, dtype=torch.int32
+    )
     last_steps_tensor = torch.tensor(last_step_pos, device=device, dtype=torch.int32)
+
     valid_mask = last_steps_tensor >= 0
-    valid_state_indices = valid_tensor[valid_mask].to(torch.int64)
+    dst_state_indices = dst_indices_tensor[valid_mask].to(torch.int64)
+    src_state_indices = src_indices_tensor[valid_mask].to(torch.int64)
     valid_last_steps = last_steps_tensor[valid_mask].to(torch.int64)
-    dst_cache[:, valid_state_indices, :] = src_cache[
-        :, valid_state_indices, valid_last_steps
+    # prepare output verify
+    dst_cache[:, dst_state_indices, :] = src_cache[
+        :, src_state_indices, valid_last_steps
     ]
 
-    move_intermediate_cache(dst_cache_clone, src_cache, valid_tensor, last_steps_tensor)
+    move_intermediate_cache(
+        dst_cache_clone,
+        src_cache,
+        dst_indices_tensor,
+        src_indices_tensor,
+        last_steps_tensor,
+    )
 
     assert_close("move_cache", dst_cache, dst_cache_clone, 1e-3)
+
+
+@pytest.mark.parametrize("V", [65, 128, 129])
+@torch.no_grad
+def test_move_intermediate_cache_copies_every_v_tile(V: int):
+    """Every V tile must be committed, including values beyond BLOCK_V=64."""
+    L, S, D, H, K = 2, 5, 4, 2, 16
+    src_cache = torch.arange(
+        L * S * D * H * V * K,
+        device=device,
+        dtype=torch.int64,
+    ).reshape(L, S, D, H, V, K)
+    src_cache = (src_cache % 2048).to(torch.bfloat16)
+    dst_cache = torch.full(
+        (L, S + 2, H, V, K),
+        -1,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    expected = dst_cache.clone()
+
+    dst_indices = torch.tensor([1, 4, 6], device=device, dtype=torch.int32)
+    src_indices = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
+    last_steps = torch.tensor([0, D - 1, 1], device=device, dtype=torch.int32)
+    expected[:, dst_indices.long()] = src_cache[
+        :, src_indices.long(), last_steps.long()
+    ]
+
+    move_intermediate_cache(
+        dst_cache,
+        src_cache,
+        dst_indices,
+        src_indices,
+        last_steps,
+    )
+
+    assert torch.equal(dst_cache, expected)
+    assert torch.equal(
+        dst_cache[:, dst_indices.long(), :, 64:],
+        expected[:, dst_indices.long(), :, 64:],
+    )
 
 
 @torch.no_grad
@@ -185,8 +238,9 @@ def test_move_intermediate_cache_mask_and_physical_layout():
     L, S, D, H, V, K = 2, 4, 3, 2, 128, 16
     src_cache = torch.randn(L, S, D, H, V, K, device=device, dtype=torch.bfloat16)
 
+    # The kernel supports a strided destination through dst_h/v/k_stride.
     dst_storage = torch.full(
-        (L, S, H, K, V),
+        (L, S + 2, H, K, V),
         -7,
         device=device,
         dtype=torch.bfloat16,
@@ -195,13 +249,20 @@ def test_move_intermediate_cache_mask_and_physical_layout():
     assert not dst_cache.is_contiguous()
     expected_storage = dst_storage.clone()
 
-    valid_tensor = torch.tensor([0, 3, 2], device=device, dtype=torch.int32)
+    dst_indices = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+    src_indices = torch.tensor([1, 2, 3], device=device, dtype=torch.int32)
     last_steps = torch.tensor([2, -1, 0], device=device, dtype=torch.int32)
-    expected_storage[:, valid_tensor[[0, 2]].long()] = src_cache[
-        :, valid_tensor[[0, 2]].long(), last_steps[[0, 2]].long()
+    expected_storage[:, dst_indices[[0, 2]].long()] = src_cache[
+        :, src_indices[[0, 2]].long(), last_steps[[0, 2]].long()
     ].reshape(L, 2, H, K, V)
 
-    move_intermediate_cache(dst_cache, src_cache, valid_tensor, last_steps)
+    move_intermediate_cache(
+        dst_cache,
+        src_cache,
+        dst_indices,
+        src_indices,
+        last_steps,
+    )
 
     assert torch.equal(dst_storage, expected_storage)
-    assert torch.all(dst_storage[:, valid_tensor[1].long()] == -7)
+    assert torch.all(dst_storage[:, dst_indices[1].long()] == -7)
