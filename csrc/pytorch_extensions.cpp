@@ -16,9 +16,7 @@
 #include "torch_helper.h"
 #include "sgl_kenel_npu_ops.h"
 #include "causal_conv1d_update/op_host/causal_conv1d_update.h"
-#ifdef SGL_KERNEL_ENABLE_A3_ONLY_OPS
 #include "causal_conv1d/op_host/causal_conv1d.h"
-#endif
 
 namespace {
 TORCH_LIBRARY_FRAGMENT(npu, m)
@@ -104,6 +102,12 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "causal_conv1d_update(Tensor x, Tensor weight, Tensor(a!) conv_state, "
         "Tensor conv_state_indices, Tensor? bias=None, Tensor? num_accepted_tokens=None, "
         "Tensor? query_start_loc=None, bool activation_mode=False, int pad_slot_id=-1) -> Tensor");
+    
+    m.def(
+        "causal_conv1d(Tensor x, Tensor weight, Tensor(a!) conv_states, Tensor? bias=None, "
+        "Tensor? query_start_loc=None, Tensor? cache_indices=None, Tensor? has_initial_state=None, "
+        "Tensor? num_accepted_tokens=None, int activation_mode=0, int pad_slot_id=-1, "
+        "int run_mode=0) -> Tensor");
 
 #ifdef SGL_KERNEL_ENABLE_A3_ONLY_OPS
     m.def(
@@ -166,21 +170,7 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "str layout_q='BSND', str layout_kv='PA_ND', "
         "bool return_softmax_lse=False) -> (Tensor, Tensor)");
 
-    m.def(
-        "compressor(Tensor x, Tensor wkv, Tensor wgate, Tensor! state_cache, "
-        "Tensor ape, Tensor norm_weight, Tensor rope_sin, Tensor rope_cos, "
-        "Tensor? state_block_table=None, Tensor? cu_seqlens=None, Tensor? seqused=None, "
-        "Tensor? start_pos=None, int rope_head_dim=64, int cmp_ratio=4, int coff=1, "
-        "float norm_eps=1e-6, int rotary_mode=1, int cache_mode=1, "
-        "int state_cache_stride_dim0=0) -> Tensor");
-
     m.def("triangular_inverse(Tensor x) -> Tensor");
-
-    m.def(
-        "causal_conv1d(Tensor x, Tensor weight, Tensor(a!) conv_states, Tensor? bias=None, "
-        "Tensor? query_start_loc=None, Tensor? cache_indices=None, Tensor? has_initial_state=None, "
-        "Tensor? num_accepted_tokens=None, int activation_mode=0, int pad_slot_id=-1, "
-        "int run_mode=0) -> Tensor");
 
     m.def(
         "unidex_copy(Tensor src, Tensor(a!) dst, Tensor src_index, "
@@ -277,8 +267,6 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 
     m.impl("sgemmc_shrink", TORCH_FN(sglang::npu_kernel::sgemmc_shrink));
 
-    m.impl("compressor", TORCH_FN(sglang::npu_kernel::compressor));
-
     m.impl("apply_token_bitmask", [](at::Tensor logits, at::Tensor bitmask, const c10::optional<at::Tensor> &indices) {
         auto indices_or_empty = indices.has_value() ? *indices : at::empty({0}, logits.options().dtype(at::kInt));
         return sglang::npu_kernel::apply_token_bitmask(logits, bitmask, indices_or_empty);
@@ -306,24 +294,7 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
                                                                     bias_or_empty, num_accepted_or_empty,
                                                                     query_loc_or_empty, activation_mode, pad_slot_id);
            });
-
-#ifdef SGL_KERNEL_ENABLE_A3_ONLY_OPS
-    m.impl("mla_preprocess", TORCH_FN(sglang::npu_kernel::mla_preprocess));
-
-    m.impl("batch_matmul_transpose", TORCH_FN(sglang::npu_kernel::batch_matmul_transpose));
-
-    m.impl("recurrent_gated_delta_rule", TORCH_FN(sglang::npu_kernel::recurrent_gated_delta_rule));
-
-    m.impl("mega_chunk_gdn", TORCH_FN(sglang::npu_kernel::mega_chunk_gdn));
-
-    m.impl("lightning_indexer", TORCH_FN(sglang::npu_kernel::lightning_indexer));
-
-    m.impl("sparse_attn_sharedkv", TORCH_FN(sglang::npu_kernel::sparse_attn_sharedkv));
-
-    m.impl("npu_sparse_attention_score", TORCH_FN(sglang::npu_kernel::sparse_attention_score));
-
-    m.impl("triangular_inverse", TORCH_FN(sglang::npu_kernel::tri_inv_col_sweep));
-
+    
     m.impl("causal_conv1d", [](const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_states,
                                const c10::optional<at::Tensor> &bias, const c10::optional<at::Tensor> &query_start_loc,
                                const c10::optional<at::Tensor> &cache_indices,
@@ -345,6 +316,24 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
             x, weight, bias_or_empty, conv_states, query_start_loc_or_empty, cache_indices_or_empty,
             has_initial_state_or_empty, num_accepted_tokens_or_empty, activation_mode, pad_slot_id, run_mode);
     });
+
+#ifdef SGL_KERNEL_ENABLE_A3_ONLY_OPS
+    m.impl("mla_preprocess", TORCH_FN(sglang::npu_kernel::mla_preprocess));
+
+    m.impl("batch_matmul_transpose", TORCH_FN(sglang::npu_kernel::batch_matmul_transpose));
+
+    m.impl("recurrent_gated_delta_rule", TORCH_FN(sglang::npu_kernel::recurrent_gated_delta_rule));
+
+    m.impl("mega_chunk_gdn", TORCH_FN(sglang::npu_kernel::mega_chunk_gdn));
+
+    m.impl("lightning_indexer", TORCH_FN(sglang::npu_kernel::lightning_indexer));
+
+    m.impl("sparse_attn_sharedkv", TORCH_FN(sglang::npu_kernel::sparse_attn_sharedkv));
+
+    m.impl("npu_sparse_attention_score", TORCH_FN(sglang::npu_kernel::sparse_attention_score));
+
+    m.impl("triangular_inverse", TORCH_FN(sglang::npu_kernel::tri_inv_col_sweep));
+
 #endif
 
 #ifdef SGL_KERNEL_ENABLE_A5_ONLY_OPS
