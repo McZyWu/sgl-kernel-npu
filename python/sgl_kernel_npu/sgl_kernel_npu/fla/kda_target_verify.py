@@ -70,10 +70,10 @@ def _kda_target_verify_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    A_log = tl.zeros((), dtype=tl.float32)
+    exp_A = tl.zeros((), dtype=tl.float32)
     dt_bias = tl.zeros((BK,), dtype=tl.float32)
     if not GATES_ARE_PREACTIVATED:
-        A_log = tl.load(A_log_ptr + k_head).to(tl.float32)
+        exp_A = tl.exp(tl.load(A_log_ptr + k_head).to(tl.float32))
         dt_bias = tl.load(
             dt_bias_ptr + k_head * K + offset_k,
             mask=mask_k,
@@ -114,14 +114,14 @@ def _kda_target_verify_kernel(
         else:
             gate_input = a + dt_bias
             if USE_LOWER_BOUND:
-                log_gate = lower_bound * tl.sigmoid(tl.exp(A_log) * gate_input)
+                log_gate = lower_bound * tl.sigmoid(exp_A * gate_input)
             else:
                 softplus = tl.where(
                     gate_input <= 20.0,
                     tl.log(1.0 + tl.exp(gate_input)),
                     gate_input,
                 )
-                log_gate = -tl.exp(A_log) * softplus
+                log_gate = -exp_A * softplus
             gate = tl.exp(log_gate)
             beta = 1.0 / (1.0 + tl.exp(-beta_input))
 
