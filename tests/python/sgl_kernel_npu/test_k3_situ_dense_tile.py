@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch_npu  # noqa: F401
-
 from sgl_kernel_npu.activation.situ import situ_and_mul
 
 
