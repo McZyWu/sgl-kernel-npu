@@ -201,10 +201,13 @@ def kda_target_verify_npu(
     The persistent and intermediate state layout is the Ascend KDA layout
     ``[..., H_v, V, K]``. The persistent cache is read-only.
 
-    When ``gates_are_preactivated`` is true, ``a`` is the log-decay
-    ``-exp(A_log) * softplus(raw_a + dt_bias)`` and ``b`` is already sigmoid
-    activated. Both gate tensors may include the SGLang leading singleton.
-    When the flag is omitted, a paired leading singleton selects this mode.
+    When ``gates_are_preactivated`` is true, ``a`` is the already computed
+    log-decay and ``b`` is already sigmoid activated. Otherwise both tensors
+    are raw: ``lower_bound`` selects the K3 safe gate
+    ``lower_bound * sigmoid(exp(A_log) * (a + dt_bias))``; when it is absent,
+    the log-decay is ``-exp(A_log) * softplus(a + dt_bias)``. Both gate tensors
+    may include the SGLang leading singleton. When the flag is omitted, a
+    paired leading singleton selects the preactivated mode.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [1, tokens, heads, dim]")
