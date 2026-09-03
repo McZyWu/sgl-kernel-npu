@@ -620,6 +620,7 @@ def main():
             pad_slot_id=args.pad_slot_id,
         )
 
+    test_causal_conv1d_dense3d_update_matches_flat2d_with_padding()
     run_negative_cases(
         device=device, dtype=torch.bfloat16, pad_slot_id=args.pad_slot_id
     )
