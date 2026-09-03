@@ -72,6 +72,21 @@ def _kda_target_verify_kernel(
     initial_idx = tl.load(initial_indices_ptr + pid_batch).to(tl.int64)
     snapshot_idx = tl.load(snapshot_indices_ptr + pid_batch).to(tl.int64)
 
+    # CUDA/NPU graph padding uses -1 as the persistent-state sentinel.  The
+    # causal-conv producer skips those requests, so its corresponding q/k/v
+    # rows are intentionally undefined.  Do not feed them through the
+    # recurrence (or write bogus snapshots); explicitly zero the output rows
+    # because later dense layers still consume the full captured batch.
+    if initial_idx < 0:
+        for step in tl.static_range(0, STEPS):
+            token = pid_batch * STEPS + step
+            tl.store(
+                out_ptr + (token * H_V + pid_hv) * V + offset_v,
+                0.0,
+                mask=mask_v,
+            )
+        return
+
     initial_offsets = (
         initial_idx * initial_stride_0
         + pid_hv * initial_stride_1
