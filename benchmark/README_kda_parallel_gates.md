@@ -1,8 +1,11 @@
 # KDA parallel-gate experiment
 
-This opt-in experiment is based on kernel PR3 at
-`fd4e17d2a4dc0812557b5bdd102230d7970f44e9`. It does not enable the experimental
-path in SGLang or change the default raw/preactivated gate dispatch.
+This opt-in experiment is included in
+[kernel PR3](https://github.com/zhaozx-cn/sgl-kernel-npu/pull/3) and paired with
+[framework PR31](https://github.com/zhaozx-cn/sglang/pull/31). The branch includes
+current `a5-k3-0828` at `1ec11e08ea3999a0f84f8b78fa57f19d59892ca5`, including
+the chunk-KDA prefill operator required by PR31's framework base. The default
+kernel dispatch is unchanged; PR31 defaults to standalone FP32 gate activation.
 
 ## What changes
 
@@ -27,9 +30,10 @@ can increase local-memory pressure or reduce available parallelism.
 
 ## Run on the serving NPU software stack
 
-Apply this change to the matching kernel source checkout and use its Python
-package with the existing built kernel library. These edits contain no C++
-changes. Verify the printed `kernel_path` and revision in the JSON output.
+Use the matching kernel source checkout and a built library that also includes
+the base branch's chunk-KDA prefill operator. The parallel-gate edits themselves
+contain no C++ changes. Verify the printed `kernel_path` and revision in the
+JSON output; an old library from before kernel PR11 is insufficient for PR31.
 
 ```bash
 python -m pytest tests/python/sgl_kernel_npu/test_kda_target_verify.py -q
@@ -68,12 +72,46 @@ verify and 75.083 us for raw fused verify. Those are old observations, not new
 benchmark results. The experiment must beat the same-run `separate` baseline,
 not merely improve upon `raw`.
 
+## Serving dispatch and preserved operators
+
+PR31 selects this kernel with these settings before graph capture, on every
+rank. Restart the server when changing them:
+
+```bash
+# Default/reference: standalone FP32 activation, existing BV selection.
+export SGLANG_NPU_KDA_VERIFY_PARALLEL_GATES=0
+export SGLANG_NPU_KDA_VERIFY_VALUE_BLOCK_SIZE=0
+
+# Independent experiment: all-token gate activation at the original BV=64.
+export SGLANG_NPU_KDA_VERIFY_PARALLEL_GATES=1
+export SGLANG_NPU_KDA_VERIFY_VALUE_BLOCK_SIZE=64
+```
+
+The value-block override accepts 0 (kernel default), 32, 64, or 128 and applies
+to either gate mode, allowing gate and tiling changes to be measured separately.
+The removed `SGLANG_NPU_FUSED_KDA_VERIFY_GATES` flag does not select either
+experimental path in PR31. The raw per-token kernel API remains available for
+the benchmark and older callers, but PR31 does not dispatch it.
+
+PR3 retains its DSpark local/global top1, ragged input/output and output-norm
+kernels, packed-QKV strides, padding sentinels, and fixed-width convolution
+coverage. These optional paths were not demonstrated to improve TPOT by the
+supplied dense/static profiles. Their preservation is not a performance claim.
+
+The fused top1 serving path additionally requires
+`SGLANG_DSPARK_FOLDED_PROPOSAL=1`,
+`SGLANG_DSPARK_FOLDED_SAMPLING=0`,
+`SGLANG_DSPARK_FUSED_LOCAL_TOP1=1`, BF16 base logits and Markov W2, a configured
+W2 TP shard, a replayable draft graph, and a greedy batch for the folded result
+to be used. W2 BF16 and TP-shard flags default to true in PR31. A launch script
+with `FOLDED_PROPOSAL=0` cannot reach the fused top1 sampler.
+
 ## Validation status
 
-28 CPU semantic tests passed by interpreting the actual kernel body with
-PyTorch tensor/pointer adapters. They cover strided raw gates and packed QKV,
+43 CPU semantic/API tests passed. The harness interprets the actual kernel body
+with PyTorch tensor/pointer adapters. The tests cover strided raw gates and packed QKV,
 grouped key/value heads, 3/8/16 steps, K/V tails, bounded/unbounded activation,
-V tiles 64/128, padding NaNs, valid cache slot 0, and disabled snapshot writes.
+V tiles 32/64/128, padding NaNs, valid cache slot 0, and disabled snapshot writes.
 The existing state/gate formulas and FP32 intermediate precision are retained.
 
 The local checks did not compile Triton, execute CANN extensions, measure UB,

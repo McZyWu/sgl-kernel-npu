@@ -86,7 +86,7 @@ def _target_verify_cpu_reference(
 
 @pytest.mark.parametrize("precompute_raw_gates", [False, True])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
-@pytest.mark.parametrize("value_block_size", [64, 128])
+@pytest.mark.parametrize("value_block_size", [32, 64, 128])
 @pytest.mark.parametrize(
     "steps,key_dim,value_dim,gate_heads",
     [(3, 7, 65, 1), (8, 128, 128, 3), (16, 128, 128, 3)],
@@ -313,3 +313,46 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
     )
     torch.testing.assert_close(scratch[1], scratch_before[1], atol=0, rtol=0)
     torch.testing.assert_close(scratch[2], scratch_before[2], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "steps,parallel_gates,value_block_size,missing_extension,error_type,error_match",
+    [
+        (17, True, 64, False, ValueError, "at most 16 verify steps"),
+        (2, False, 16, False, ValueError, "value_block_size must be"),
+        (2, True, 64, True, RuntimeError, "requires Triton-Ascend"),
+    ],
+)
+def test_kda_target_verify_rejects_unsupported_experiment(
+    monkeypatch,
+    steps,
+    parallel_gates,
+    value_block_size,
+    missing_extension,
+    error_type,
+    error_match,
+):
+    # These are host-side API errors; no device launch is needed.
+    if missing_extension:
+        monkeypatch.setitem(kda_target_verify_npu.__globals__, "cann_extension", None)
+    q = torch.zeros(1, steps, 1, 4, dtype=torch.bfloat16)
+    with pytest.raises(error_type, match=error_match):
+        kda_target_verify_npu(
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(4),
+            q=q,
+            k=q,
+            v=q,
+            a=q,
+            b=torch.zeros(1, steps, 1, dtype=torch.bfloat16),
+            initial_state_source=torch.zeros(1, 1, 4, 4, dtype=torch.bfloat16),
+            initial_state_indices=torch.zeros(1, dtype=torch.int64),
+            intermediate_states_buffer=torch.zeros(
+                1, steps, 1, 4, 4, dtype=torch.bfloat16
+            ),
+            intermediate_state_indices=torch.zeros(1, dtype=torch.int64),
+            cache_steps=steps,
+            gates_are_preactivated=False,
+            precompute_raw_gates=parallel_gates,
+            value_block_size=value_block_size,
+        )
