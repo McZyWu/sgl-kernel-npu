@@ -84,19 +84,49 @@ def _target_verify_cpu_reference(
     return output, expected_snapshots
 
 
-def test_kda_target_verify_raw_gates_match_preactivated_gates():
+@pytest.mark.parametrize("precompute_raw_gates", [False, True])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+@pytest.mark.parametrize("value_block_size", [64, 128])
+@pytest.mark.parametrize(
+    "steps,key_dim,value_dim,gate_heads",
+    [(3, 7, 65, 1), (8, 128, 128, 3), (16, 128, 128, 3)],
+)
+def test_kda_target_verify_raw_gates_match_preactivated_gates(
+    precompute_raw_gates,
+    lower_bound,
+    value_block_size,
+    steps,
+    key_dim,
+    value_dim,
+    gate_heads,
+):
     device = torch.device("npu")
-    batch, steps, heads, key_dim, value_dim = 2, 3, 2, 8, 8
+    batch, heads = 2, 3
     tokens = batch * steps
-    q = torch.randn(1, tokens, heads, key_dim, dtype=torch.bfloat16, device=device)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, heads, value_dim, dtype=torch.bfloat16, device=device)
-    raw_a = torch.randn_like(q)
-    raw_b = torch.randn(1, tokens, heads, dtype=torch.bfloat16, device=device)
-    A_log = torch.randn(1, 1, heads, 1, dtype=torch.float32, device=device)
-    dt_bias = torch.randn(heads * key_dim, dtype=torch.float32, device=device)
-    assert A_log.shape == (1, 1, heads, 1)
-    assert dt_bias.shape == (heads * key_dim,)
+    # Model the serving kernel's packed QKV views and noncontiguous raw gates.
+    packed_qkv = torch.randn(
+        1,
+        tokens,
+        heads * (key_dim + value_dim) + gate_heads * key_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    q, k, v = packed_qkv.split(
+        [heads * key_dim, gate_heads * key_dim, heads * value_dim], dim=-1
+    )
+    q = q.view(1, tokens, heads, key_dim)
+    k = k.view(1, tokens, gate_heads, key_dim)
+    v = v.view(1, tokens, heads, value_dim)
+    raw_a = torch.randn(
+        1, tokens, gate_heads, key_dim * 2, dtype=torch.bfloat16, device=device
+    )[..., ::2]
+    raw_b = torch.randn(1, tokens, heads * 2, dtype=torch.bfloat16, device=device)[
+        ..., ::2
+    ]
+    A_log = torch.randn(1, 1, gate_heads, 1, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(gate_heads * key_dim, dtype=torch.float32, device=device)
+    assert A_log.shape == (1, 1, gate_heads, 1)
+    assert dt_bias.shape == (gate_heads * key_dim,)
     initial_state = torch.randn(
         batch, heads, value_dim, key_dim, dtype=torch.bfloat16, device=device
     )
@@ -112,7 +142,6 @@ def test_kda_target_verify_raw_gates_match_preactivated_gates():
         device=device,
     )
     preactivated_scratch = torch.empty_like(raw_scratch)
-    lower_bound = -5.0
 
     raw_output = kda_target_verify_npu(
         A_log=A_log,
@@ -129,9 +158,11 @@ def test_kda_target_verify_raw_gates_match_preactivated_gates():
         cache_steps=steps,
         gates_are_preactivated=False,
         lower_bound=lower_bound,
+        precompute_raw_gates=precompute_raw_gates,
+        value_block_size=value_block_size,
     )
     preactivated_a = fused_kda_gate_npu(
-        raw_a.flatten(-2),
+        raw_a.flatten(-2).contiguous(),
         A_log,
         key_dim,
         gate_bias=dt_bias,
@@ -160,6 +191,24 @@ def test_kda_target_verify_raw_gates_match_preactivated_gates():
         raw_scratch.float(), preactivated_scratch.float(), rtol=2e-2, atol=2e-2
     )
 
+    with pytest.raises(ValueError, match="precompute_raw_gates requires raw gates"):
+        kda_target_verify_npu(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=preactivated_a,
+            b=preactivated_b,
+            initial_state_source=initial_state,
+            initial_state_indices=initial_indices,
+            intermediate_states_buffer=preactivated_scratch,
+            intermediate_state_indices=intermediate_indices,
+            cache_steps=steps,
+            gates_are_preactivated=True,
+            precompute_raw_gates=True,
+        )
+
     with pytest.raises(
         ValueError, match="lower_bound must already be reflected in preactivated gates"
     ):
@@ -177,11 +226,15 @@ def test_kda_target_verify_raw_gates_match_preactivated_gates():
             intermediate_state_indices=intermediate_indices,
             cache_steps=steps,
             gates_are_preactivated=True,
-            lower_bound=lower_bound,
+            lower_bound=-5.0,
         )
 
 
-def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot():
+@pytest.mark.parametrize("precompute_raw_gates", [False, True])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
+    precompute_raw_gates, lower_bound
+):
     device = torch.device("npu")
     batch, steps, heads, key_dim, value_dim = 3, 4, 2, 8, 8
     tokens = batch * steps
@@ -204,7 +257,7 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot():
         2, heads, value_dim, key_dim, dtype=torch.bfloat16, device=device
     )
     initial_indices = torch.tensor([0, -1, 1], dtype=torch.int32, device=device)
-    intermediate_indices = torch.arange(batch, dtype=torch.int32, device=device)
+    intermediate_indices = torch.tensor([0, 1, -1], dtype=torch.int32, device=device)
     scratch = torch.full(
         (batch, steps, heads, value_dim, key_dim),
         3.0,
@@ -212,7 +265,6 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot():
         device=device,
     )
     scratch_before = scratch.clone()
-    lower_bound = -5.0
     expected_output, expected_scratch = _target_verify_cpu_reference(
         A_log=A_log,
         dt_bias=dt_bias,
@@ -244,6 +296,7 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot():
         cache_steps=steps,
         gates_are_preactivated=False,
         lower_bound=lower_bound,
+        precompute_raw_gates=precompute_raw_gates,
     )
 
     torch.testing.assert_close(
@@ -259,3 +312,4 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot():
         rtol=0,
     )
     torch.testing.assert_close(scratch[1], scratch_before[1], atol=0, rtol=0)
+    torch.testing.assert_close(scratch[2], scratch_before[2], atol=0, rtol=0)

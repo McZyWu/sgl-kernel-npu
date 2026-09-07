@@ -4,6 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    import triton.language.extra.cann.extension as cann_extension
+except ImportError:
+    cann_extension = None
+
 
 @triton.jit
 def _kda_target_verify_kernel(
@@ -54,6 +59,8 @@ def _kda_target_verify_kernel(
     BV: tl.constexpr,
     GATES_ARE_PREACTIVATED: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    PRECOMPUTE_RAW_GATES: tl.constexpr,
+    BT: tl.constexpr,
 ):
     pid_batch = tl.program_id(0)
     pid_hv = tl.program_id(1)
@@ -87,6 +94,42 @@ def _kda_target_verify_kernel(
             )
         return
 
+    if PRECOMPUTE_RAW_GATES:
+        # Gate activation has no state dependency. Vectorize all verify tokens
+        # before loading the large recurrent state tile; keep only the final
+        # FP32 decay/beta values live across the sequential state updates.
+        gate_steps = tl.arange(0, BT)
+        gate_tokens = pid_batch * STEPS + gate_steps
+        raw_gate = tl.load(
+            a_ptr
+            + gate_tokens[:, None] * stride_a_token
+            + k_head * stride_a_head
+            + offset_k[None, :] * stride_a_dim,
+            mask=(gate_steps[:, None] < STEPS) & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        gate_bias = tl.load(
+            dt_bias_ptr + k_head * K + offset_k, mask=mask_k, other=0.0
+        ).to(tl.float32)
+        gate_exp_A = tl.exp(tl.load(A_log_ptr + k_head).to(tl.float32))
+        gate_input_all = raw_gate + gate_bias[None, :]
+        if USE_LOWER_BOUND:
+            log_gate_all = lower_bound * tl.sigmoid(gate_exp_A * gate_input_all)
+        else:
+            softplus_all = tl.where(
+                gate_input_all <= 20.0,
+                tl.log(1.0 + tl.exp(gate_input_all)),
+                gate_input_all,
+            )
+            log_gate_all = -gate_exp_A * softplus_all
+        decay_all = tl.exp(log_gate_all)
+        beta_raw_all = tl.load(
+            b_ptr + gate_tokens * stride_b_token + pid_hv * stride_b_head,
+            mask=gate_steps < STEPS,
+            other=0.0,
+        ).to(tl.float32)
+        beta_all = 1.0 / (1.0 + tl.exp(-beta_raw_all))
+
     initial_offsets = (
         initial_idx * initial_stride_0
         + pid_hv * initial_stride_1
@@ -101,7 +144,7 @@ def _kda_target_verify_kernel(
 
     exp_A = tl.zeros((), dtype=tl.float32)
     dt_bias = tl.zeros((BK,), dtype=tl.float32)
-    if not GATES_ARE_PREACTIVATED:
+    if not GATES_ARE_PREACTIVATED and not PRECOMPUTE_RAW_GATES:
         exp_A = tl.exp(tl.load(A_log_ptr + k_head).to(tl.float32))
         dt_bias = tl.load(
             dt_bias_ptr + k_head * K + offset_k,
@@ -135,23 +178,32 @@ def _kda_target_verify_kernel(
             mask=mask_v,
             other=0.0,
         ).to(tl.float32)
-        a = tl.load(
-            a_ptr
-            + token * stride_a_token
-            + k_head * stride_a_head
-            + offset_k * stride_a_dim,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        beta_input = tl.load(
-            b_ptr + token * stride_b_token + pid_hv * stride_b_head
-        ).to(tl.float32)
+        if not PRECOMPUTE_RAW_GATES:
+            a = tl.load(
+                a_ptr
+                + token * stride_a_token
+                + k_head * stride_a_head
+                + offset_k * stride_a_dim,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            beta_input = tl.load(
+                b_ptr + token * stride_b_token + pid_hv * stride_b_head
+            ).to(tl.float32)
 
         q = q / (tl.sqrt(tl.sum(q * q, axis=0)) + 1e-6)
         k = k / (tl.sqrt(tl.sum(k * k, axis=0)) + 1e-6)
         q *= scale
 
-        if GATES_ARE_PREACTIVATED:
+        if PRECOMPUTE_RAW_GATES:
+            # Static slices avoid a generic gather/reduction in each step.
+            gate = cann_extension.extract_slice(
+                decay_all, offsets=(step, 0), sizes=(1, BK), strides=(1, 1)
+            ).reshape((BK,))
+            beta = cann_extension.extract_slice(
+                beta_all, offsets=(step,), sizes=(1,), strides=(1,)
+            ).reshape(())
+        elif GATES_ARE_PREACTIVATED:
             gate = tl.exp(a)
             beta = beta_input
         else:
@@ -210,6 +262,8 @@ def kda_target_verify_npu(
     scale: Optional[float] = None,
     gates_are_preactivated: Optional[bool] = None,
     lower_bound: Optional[float] = None,
+    precompute_raw_gates: bool = False,
+    value_block_size: Optional[int] = None,
 ) -> torch.Tensor:
     """KDA fixed-width target verification with per-step state snapshots.
 
@@ -223,6 +277,12 @@ def kda_target_verify_npu(
     the log-decay is ``-exp(A_log) * softplus(a + dt_bias)``. Both gate tensors
     may include the SGLang leading singleton. When the flag is omitted, a
     paired leading singleton selects the preactivated mode.
+
+    ``precompute_raw_gates`` is an opt-in experiment for at most 16 verify
+    steps: activate gates over the token axis before the recurrent loop.
+    ``value_block_size`` optionally overrides the V tile (32, 64, or 128).
+    Defaults retain the original dispatch; benchmark on the target NPU before
+    enabling either option in serving.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [1, tokens, heads, dim]")
@@ -317,12 +377,23 @@ def kda_target_verify_npu(
         raise ValueError("scale must be positive")
     if gates_are_preactivated and lower_bound is not None:
         raise ValueError("lower_bound must already be reflected in preactivated gates")
+    if precompute_raw_gates:
+        if gates_are_preactivated:
+            raise ValueError("precompute_raw_gates requires raw gates")
+        if cache_steps > 16:
+            raise ValueError("precompute_raw_gates supports at most 16 verify steps")
+        if cann_extension is None or not hasattr(cann_extension, "extract_slice"):
+            raise RuntimeError(
+                "precompute_raw_gates requires Triton-Ascend cann.extract_slice"
+            )
+    if value_block_size not in (None, 32, 64, 128):
+        raise ValueError("value_block_size must be None, 32, 64, or 128")
 
     out = torch.empty((1, q.shape[1], h_v, value_dim), dtype=v.dtype, device=v.device)
     bk = triton.next_power_of_2(key_dim)
     if bk > 256:
         raise ValueError("key dimensions greater than 256 are unsupported")
-    bv = min(64, triton.next_power_of_2(value_dim))
+    bv = min(value_block_size or 64, triton.next_power_of_2(value_dim))
     grid = (batch, h_v, triton.cdiv(value_dim, bv))
     _kda_target_verify_kernel[grid](
         A_log,
@@ -372,6 +443,8 @@ def kda_target_verify_npu(
         BV=bv,
         GATES_ARE_PREACTIVATED=gates_are_preactivated,
         USE_LOWER_BOUND=lower_bound is not None,
+        PRECOMPUTE_RAW_GATES=precompute_raw_gates,
+        BT=triton.next_power_of_2(cache_steps) if precompute_raw_gates else 1,
         num_warps=1,
         num_stages=3,
         multibuffer=False,
