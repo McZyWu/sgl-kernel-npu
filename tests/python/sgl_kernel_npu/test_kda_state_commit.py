@@ -1,10 +1,53 @@
-import torch
+from unittest.mock import patch
 
+import torch
 from sgl_kernel_npu.mamba.kda_state_commit import (
     commit_kda_extended_conv_state,
     move_kda_temporal_snapshot,
     scatter_kda_conv_snapshot,
 )
+
+
+def test_temporal_full_request_occupancy_uses_existing_mover():
+    # Dispatch must decline this case before attempting any NPU launch.
+    dst = torch.empty((2, 32, 1, 8, 8))
+    src = torch.empty((2, 32, 2, 1, 8, 8))
+    indices = torch.arange(32, dtype=torch.int32)
+    steps = torch.zeros(32, dtype=torch.int32)
+    for core_count in (32, 64):
+        with patch(
+            "sgl_kernel_npu.mamba.kda_state_commit._vector_core_count",
+            return_value=core_count,
+        ):
+            assert not move_kda_temporal_snapshot(dst, src, indices, indices, steps)
+
+
+def test_extended_fully_accepted_tracking_still_copies():
+    device = torch.device("npu")
+    original = torch.randn((5, 4, 10, 1152), dtype=torch.bfloat16, device=device)
+    extended = original.clone()
+    dst = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    src = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    steps = torch.tensor([7, 7], dtype=torch.int32, device=device)
+    assert commit_kda_extended_conv_state(extended, dst, src, steps, 8)
+    torch.npu.synchronize()
+    expected = original.clone()
+    expected[:, 3, -3:] = original[:, 1, -3:]
+    torch.testing.assert_close(extended, expected, rtol=0, atol=0)
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        assert commit_kda_extended_conv_state(extended, dst, src, steps, 8)
+    for runtime_steps in ([7, 7], [6, 7], [-1, -1]):
+        extended.copy_(original)
+        steps.copy_(torch.tensor(runtime_steps, dtype=torch.int32, device=device))
+        expected.copy_(original)
+        for dst_slot, src_slot, step in zip((0, 3), (0, 1), runtime_steps):
+            if step >= 0:
+                expected[:, dst_slot, -3:] = original[:, src_slot, step : step + 3]
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(extended, expected, rtol=0, atol=0)
 
 
 def test_temporal_production_layout_matches_under_graph_replay():
