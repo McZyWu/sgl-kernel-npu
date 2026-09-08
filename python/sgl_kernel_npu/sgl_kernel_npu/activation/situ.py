@@ -307,6 +307,43 @@ def situ_and_mul_quant(
     return out.reshape(*x.shape[:-1], half_cols), scale
 
 
+@triton.jit
+def _situ_and_mul_narrow_dense_kernel(
+    x,
+    out,
+    N_ROWS,
+    HALF_COLS: tl.constexpr,
+    BETA: tl.constexpr,
+    INV_BETA: tl.constexpr,
+    DO_LINEAR_BETA: tl.constexpr,
+    LINEAR_BETA: tl.constexpr,
+    INV_LINEAR_BETA: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # Vectorize adjacent rows together. TP32 K3 shared experts have only 192
+    # columns, so serial row loops and 1024..8192-wide autotune tiles waste work.
+    columns = tl.arange(0, BLOCK_H)
+    row_offsets = tl.arange(0, BLOCK_ROWS)
+    for tile in range(
+        tl.program_id(0), tl.cdiv(N_ROWS, BLOCK_ROWS), tl.num_programs(0)
+    ):
+        rows = tile * BLOCK_ROWS + row_offsets
+        mask = (rows[:, None] < N_ROWS) & (columns[None, :] < HALF_COLS)
+        offsets = rows[:, None].to(tl.int64) * (2 * HALF_COLS) + columns[None, :]
+        gate = tl.load(x + offsets, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(x + offsets + HALF_COLS, mask=mask, other=0.0).to(tl.float32)
+        situ_a = BETA * libdevice.tanh(gate * INV_BETA) * tl.sigmoid(gate)
+        if DO_LINEAR_BETA:
+            up = LINEAR_BETA * libdevice.tanh(up * INV_LINEAR_BETA)
+        values = situ_a * up
+        tl.store(
+            out + rows[:, None].to(tl.int64) * HALF_COLS + columns[None, :],
+            values.to(out.dtype.element_ty),
+            mask=mask,
+        )
+
+
 def situ_and_mul(
     x,
     group_list=None,
@@ -366,6 +403,26 @@ def situ_and_mul(
     linear_beta_v = linear_beta if do_linear_beta else 1.0
 
     _, num_vectorcore = get_device_properties()
+    if not has_group_list and x_2d.dtype == torch.bfloat16 and 0 < h // 2 <= 512:
+        if s:
+            _situ_and_mul_narrow_dense_kernel[
+                (min(num_vectorcore, triton.cdiv(s, 4)),)
+            ](
+                x_2d,
+                out,
+                s,
+                HALF_COLS=h // 2,
+                BETA=beta,
+                INV_BETA=1.0 / beta,
+                DO_LINEAR_BETA=do_linear_beta,
+                LINEAR_BETA=linear_beta_v,
+                INV_LINEAR_BETA=(1.0 / linear_beta_v) if do_linear_beta else 1.0,
+                BLOCK_ROWS=4,
+                BLOCK_H=triton.next_power_of_2(h // 2),
+                num_warps=4,
+            )
+        return out.reshape(*x.shape[:-1], h // 2)
+
     _situ_and_mul_kernel[(num_vectorcore,)](
         x_2d,
         group_list_arg,
