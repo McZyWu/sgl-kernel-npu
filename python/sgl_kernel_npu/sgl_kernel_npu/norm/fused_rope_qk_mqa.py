@@ -110,6 +110,145 @@ def fused_rope_qk_mqa_kernel_opt(
         )
 
 
+@triton.jit
+def _fused_rope_qk_mqa_padded_kernel(
+    query_ptr,  # [T, Hq, D]
+    key_ptr,  # [T, Hk, D]
+    cos_sin_ptr,  # [max_pos, D_ROPE]
+    out_q_ptr,
+    out_k_ptr,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_ct,
+    stride_cd,
+    stride_oqt,
+    stride_oqh,
+    stride_oqd,
+    stride_okt,
+    stride_okh,
+    stride_okd,
+    Hq: tl.constexpr,
+    Hk: tl.constexpr,
+    BLOCK_HQ: tl.constexpr,
+    BLOCK_HK: tl.constexpr,
+    D_HEAD: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    IS_NEOX_STYLE: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+
+    # -------- rotary indices
+    d = tl.arange(0, D_ROPE // 2)
+    if IS_NEOX_STYLE:
+        idx_even = d
+        idx_odd = d + D_ROPE // 2
+    else:
+        idx_even = d * 2
+        idx_odd = d * 2 + 1
+
+    # cos / sin (shared across all heads for this position)
+    cos = tl.load(cos_sin_ptr + pid_t * stride_ct + d * stride_cd)
+    sin = tl.load(cos_sin_ptr + pid_t * stride_ct + (d + D_ROPE // 2) * stride_cd)
+
+    # ================= Q (all Hq heads at once) =================
+    head_offs = tl.arange(0, BLOCK_HQ)
+    q_mask = head_offs[:, None] < Hq
+    q_base = query_ptr + pid_t * stride_qt
+
+    q1 = tl.load(
+        q_base + head_offs[:, None] * stride_qh + idx_even[None, :] * stride_qd,
+        mask=q_mask,
+        other=0,
+    )
+    q2 = tl.load(
+        q_base + head_offs[:, None] * stride_qh + idx_odd[None, :] * stride_qd,
+        mask=q_mask,
+        other=0,
+    )
+
+    q_out1 = (q1 * cos[None, :]) - (q2 * sin[None, :])
+    q_out2 = (q1 * sin[None, :]) + (q2 * cos[None, :])
+
+    oq_base = out_q_ptr + pid_t * stride_oqt
+    tl.store(
+        oq_base + head_offs[:, None] * stride_oqh + idx_even[None, :] * stride_oqd,
+        q_out1,
+        mask=q_mask,
+    )
+    tl.store(
+        oq_base + head_offs[:, None] * stride_oqh + idx_odd[None, :] * stride_oqd,
+        q_out2,
+        mask=q_mask,
+    )
+
+    # ================= K (unique Hk key heads only) =================
+    kh_offs = tl.arange(0, BLOCK_HK)
+    k_mask = kh_offs[:, None] < Hk
+    k_base = key_ptr + pid_t * stride_kt
+
+    k1 = tl.load(
+        k_base + kh_offs[:, None] * stride_kh + idx_even[None, :] * stride_kd,
+        mask=k_mask,
+        other=0,
+    )
+    k2 = tl.load(
+        k_base + kh_offs[:, None] * stride_kh + idx_odd[None, :] * stride_kd,
+        mask=k_mask,
+        other=0,
+    )
+
+    k_out1 = (k1 * cos[None, :]) - (k2 * sin[None, :])
+    k_out2 = (k1 * sin[None, :]) + (k2 * cos[None, :])
+
+    ok_base = out_k_ptr + pid_t * stride_okt
+    tl.store(
+        ok_base + kh_offs[:, None] * stride_okh + idx_even[None, :] * stride_okd,
+        k_out1,
+        mask=k_mask,
+    )
+    tl.store(
+        ok_base + kh_offs[:, None] * stride_okh + idx_odd[None, :] * stride_okd,
+        k_out2,
+        mask=k_mask,
+    )
+
+    # ================= pass-through (compile-time pruning) =================
+    if D_HEAD > D_ROPE:
+        dp = tl.arange(0, D_HEAD - D_ROPE)
+        # Q pass-through
+        q_pass = tl.load(
+            q_base
+            + head_offs[:, None] * stride_qh
+            + (dp + D_ROPE)[None, :] * stride_qd,
+            mask=q_mask,
+            other=0,
+        )
+        tl.store(
+            oq_base
+            + head_offs[:, None] * stride_oqh
+            + (dp + D_ROPE)[None, :] * stride_oqd,
+            q_pass,
+            mask=q_mask,
+        )
+        # K pass-through
+        k_pass = tl.load(
+            k_base + kh_offs[:, None] * stride_kh + (dp + D_ROPE)[None, :] * stride_kd,
+            mask=k_mask,
+            other=0,
+        )
+        tl.store(
+            ok_base
+            + kh_offs[:, None] * stride_okh
+            + (dp + D_ROPE)[None, :] * stride_okd,
+            k_pass,
+            mask=k_mask,
+        )
+
+
 def fused_rope_qk_mqa(query, key, cos_sin, rotary_dim, is_neox_style):
     T, Hq, D = query.shape
     _, Hk, _ = key.shape
@@ -119,7 +258,18 @@ def fused_rope_qk_mqa(query, key, cos_sin, rotary_dim, is_neox_style):
 
     grid = (T,)
 
-    fused_rope_qk_mqa_kernel_opt[grid](
+    # Preserve the original compiled kernel for existing power-of-two heads.
+    # Stacked draft layers can produce 5, 10 or 20 heads; only those need masks.
+    if Hq & (Hq - 1) == 0 and Hk & (Hk - 1) == 0:
+        kernel = fused_rope_qk_mqa_kernel_opt
+        tile_args = {}
+    else:
+        kernel = _fused_rope_qk_mqa_padded_kernel
+        tile_args = {
+            "BLOCK_HQ": triton.next_power_of_2(Hq),
+            "BLOCK_HK": triton.next_power_of_2(Hk),
+        }
+    kernel[grid](
         query,
         key,
         cos_sin,
@@ -144,6 +294,7 @@ def fused_rope_qk_mqa(query, key, cos_sin, rotary_dim, is_neox_style):
         D_HEAD=D,
         D_ROPE=rotary_dim,
         IS_NEOX_STYLE=is_neox_style,
+        **tile_args,
     )
 
     return out_q, out_k
