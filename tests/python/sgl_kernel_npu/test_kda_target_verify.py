@@ -232,11 +232,14 @@ def test_kda_target_verify_raw_gates_match_preactivated_gates(
 
 @pytest.mark.parametrize("precompute_raw_gates", [False, True])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
+@pytest.mark.parametrize("shape", [(4, 2, 8, 8), (7, 6, 128, 128)])
+@pytest.mark.parametrize("graph_replay", [False, True])
 def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
-    precompute_raw_gates, lower_bound
+    precompute_raw_gates, lower_bound, shape, graph_replay
 ):
     device = torch.device("npu")
-    batch, steps, heads, key_dim, value_dim = 3, 4, 2, 8, 8
+    batch = 3
+    steps, heads, key_dim, value_dim = shape
     tokens = batch * steps
     q = torch.randn(1, tokens, heads, key_dim, dtype=torch.bfloat16, device=device)
     k = torch.randn_like(q)
@@ -265,7 +268,7 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
         device=device,
     )
     scratch_before = scratch.clone()
-    expected_output, expected_scratch = _target_verify_cpu_reference(
+    reference_args = dict(
         A_log=A_log,
         dt_bias=dt_bias,
         q=q,
@@ -281,7 +284,7 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
         lower_bound=lower_bound,
     )
 
-    actual = kda_target_verify_npu(
+    kernel_args = dict(
         A_log=A_log,
         dt_bias=dt_bias,
         q=q,
@@ -298,6 +301,19 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
         lower_bound=lower_bound,
         precompute_raw_gates=precompute_raw_gates,
     )
+    initial_before = initial_state.clone()
+    actual = kda_target_verify_npu(**kernel_args)
+    if graph_replay:
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual = kda_target_verify_npu(**kernel_args)
+        # Replay must read updated gates and write the snapshots again.
+        raw_b[:, :steps].add_(0.75)
+        scratch.copy_(scratch_before)
+        graph.replay()
+        torch.npu.synchronize()
+    expected_output, expected_scratch = _target_verify_cpu_reference(**reference_args)
 
     torch.testing.assert_close(
         actual.cpu().float(), expected_output.float(), atol=2e-2, rtol=2e-2
@@ -313,6 +329,7 @@ def test_kda_target_verify_padding_matches_cpu_and_preserves_snapshot(
     )
     torch.testing.assert_close(scratch[1], scratch_before[1], atol=0, rtol=0)
     torch.testing.assert_close(scratch[2], scratch_before[2], atol=0, rtol=0)
+    torch.testing.assert_close(initial_state, initial_before, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

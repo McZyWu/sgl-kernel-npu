@@ -100,14 +100,23 @@ def _kda_target_verify_kernel(
         # FP32 decay/beta values live across the sequential state updates.
         gate_steps = tl.arange(0, BT)
         gate_tokens = pid_batch * STEPS + gate_steps
-        raw_gate = tl.load(
-            a_ptr
-            + gate_tokens[:, None] * stride_a_token
-            + k_head * stride_a_head
-            + offset_k[None, :] * stride_a_dim,
-            mask=(gate_steps[:, None] < STEPS) & mask_k[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        # Load packed/strided gates as one vector before restoring the token
+        # axis. Narrow rows must not become sub-block 2D gather operations.
+        gate_offsets = tl.arange(0, BT * BK)
+        gate_token_offsets = pid_batch * STEPS + gate_offsets // BK
+        gate_key_offsets = gate_offsets % BK
+        raw_gate = (
+            tl.load(
+                a_ptr
+                + gate_token_offsets * stride_a_token
+                + k_head * stride_a_head
+                + gate_key_offsets * stride_a_dim,
+                mask=(gate_offsets // BK < STEPS) & (gate_key_offsets < K),
+                other=0.0,
+            )
+            .to(tl.float32)
+            .reshape((BT, BK))
+        )
         gate_bias = tl.load(
             dt_bias_ptr + k_head * K + offset_k, mask=mask_k, other=0.0
         ).to(tl.float32)
@@ -200,9 +209,14 @@ def _kda_target_verify_kernel(
             gate = cann_extension.extract_slice(
                 decay_all, offsets=(step, 0), sizes=(1, BK), strides=(1, 1)
             ).reshape((BK,))
-            beta = cann_extension.extract_slice(
-                beta_all, offsets=(step,), sizes=(1,), strides=(1,)
-            ).reshape(())
+            # A one-element reduction produces a scalar without constructing
+            # the zero-dimensional block type forbidden by Triton reshape.
+            beta = tl.sum(
+                cann_extension.extract_slice(
+                    beta_all, offsets=(step,), sizes=(1,), strides=(1,)
+                ),
+                axis=0,
+            )
         elif GATES_ARE_PREACTIVATED:
             gate = tl.exp(a)
             beta = beta_input
