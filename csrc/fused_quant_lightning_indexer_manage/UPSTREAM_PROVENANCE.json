@@ -136,7 +136,8 @@
     "explicit tiling serialization",
     "registered DRAM pointer with owning CPU tensor for Copy-SFA",
     "explicit field-wise GM tiling load for direct launch",
-    "vector postprocess and victim unpack; SIMT requires donor OPP user-UB reservation"
+    "vector postprocess and victim unpack; SIMT requires donor OPP user-UB reservation",
+    "direct-launch entry flushes every AIV DCache after scalar output publication"
   ],
   "adapted_files": [
     {

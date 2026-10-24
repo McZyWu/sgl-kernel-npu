@@ -22,14 +22,16 @@ static validation without submitting a kernel.
 
 For each request, let `S` be its final KV length, `P` its offloaded prefix,
 and `C` its persistent sparse capacity. TopK searches the entire causal-visible
-range. Selected tail sources use `C + source_id % 256`, are always hits, and do
-not enter the persistent pool or miss-copy plan. The caller maintains those
-additional 256 packed KV slots. This does not append all tail tokens to TopK.
+range. Selected tail sources use `C + (source_id - P)`, are always hits, and do
+not enter the persistent pool or miss-copy plan. The caller maintains at least
+`ceil((S-P)/128)*128` additional packed KV slots. This does not append all tail
+tokens to TopK. These slots are relative to P, including on odd page boundaries.
 
 The native contract supports `K=2048`, page size 128, 1–14 query routes,
-`C<=32384`, and source capacity at most `2**21`. Prefix and capacity are page
+`C<=floor((32766-ceil((S-P)/128)*128)/128)*128`, and source capacity at most
+`2**21`. Prefix and capacity are page
 aligned. Offloaded requests require `P>=2048`, `C<=P`,
-`P<=S-(Q-1)`, and `0<=S-P<=256`. If `P<=Q*2048`, `C=P`; otherwise `C>=Q*2048`.
+`P<=S-(Q-1)`. If `P<=Q*2048`, `C=P`; otherwise `C>=Q*2048`.
 Request states are `-3` dense, `-2` first offload, and `-1` steady offload.
 
 The direct-launch host serializes the donor's tiling and actual weights/key/scale
@@ -51,3 +53,8 @@ python3 -m pytest -q tests/test_fused_quant_lightning_indexer_manage_a5.py
 Run `tests/test_lim_copy_sfa_c8.py` for the paired registered-DRAM Copy-SFA path.
 The SGLang integration initially enables Q1 only; native MTP contracts do not
 enable framework speculation or rollback handling.
+
+The direct-launch entry explicitly flushes each AIV's DCache after management
+publishes its compact miss counts and invalid rows. GlobalTensor::SetValue
+updates DCache; a core barrier alone does not make those stores visible in GM.
+Homogeneous dense counts already use DMA, which is why that path is unaffected.

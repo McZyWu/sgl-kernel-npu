@@ -170,13 +170,14 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
             key[..., 0] = -8
             for request, length in ((1, a), (2, b), (3, c)):
                 key[request, max(0, length - capacity) : length, 0] = 8
-                # Framework writes dense identity KV and the latest 256 tail rows.
+                # Framework writes dense identity KV and prefix-relative tail rows.
                 if length <= capacity:
                     hbm.view(rows, physical, 656)[request, :length].copy_(
                         logical[request, :length].to(device)
                     )
-                source = torch.arange(max(0, length - 256), length, dtype=torch.int64)
-                destination = capacity + source.remainder(256)
+                tail_prefix = ((length - 1) // 128) * 128
+                source = torch.arange(tail_prefix, length, dtype=torch.int64)
+                destination = capacity + source - tail_prefix
                 hbm.view(rows, physical, 656)[request].index_copy_(
                     0, destination.to(device), logical[request, source].to(device)
                 )
@@ -226,7 +227,9 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
                     selected_tail = actual_ids >= ((length - 1) // 128) * 128
                     assert torch.equal(
                         actual_slots[selected_tail],
-                        capacity + actual_ids[selected_tail] % 256,
+                        capacity
+                        + actual_ids[selected_tail]
+                        - ((length - 1) // 128) * 128,
                     )
             assert torch.count_nonzero(output[1]) == 0
             assert miss_counts[1] == 0

@@ -28,5 +28,15 @@ __global__ __aicore__ void fused_quant_lightning_indexer_manage(
         cacheTokens, requestState, reqPoolEntries, cacheSlots, topkSourceIds,
         topkSlots, topkMissCounts, missSrcIds, missDstSlots, missCount,
         cacheSlotsOut, workspace, tiling);
+    if ASCEND_IS_AIV {
+        // The management publishers use scalar GM stores for compact counts
+        // and invalid rows. SetValue dirties the AIV DCache; SyncAll and the
+        // direct-launch return do not publish those stores to GM. Flush on
+        // every AIV, including owners of invalid non-offload requests.
+        AscendC::GlobalTensor<int32_t> scalarOutputs;
+        scalarOutputs.SetGlobalBuffer((__gm__ int32_t *)topkMissCounts);
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                         AscendC::DcciDst::CACHELINE_OUT>(scalarOutputs);
+    }
 #endif
 }
