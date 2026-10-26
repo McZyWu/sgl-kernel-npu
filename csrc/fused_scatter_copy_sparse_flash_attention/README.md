@@ -9,12 +9,12 @@ The registered operator is `torch.ops.npu.fused_scatter_copy_sparse_flash_attent
 Supported integration scope:
 
 - `query` is TND `[T, H, 512]`, `query_rope` is `[T, H, 64]`, and cumulative query lengths have one entry per request. The native host accepts `B <= T <= 16*B`; SGLang's framework route still requires `T=B` and disables speculation.
-- CKV 512, KPE 64, TopK 2048, page size 128, and one KV head. The HBM page table is `[B, hbm_pages_per_request]`; the DRAM table is `[B, dram_pages_per_request]`. The current framework uses resident capacity `C=2048` and 16 HBM pages per request.
+- CKV 512, KPE 64, TopK 2048, page size 128, and one KV head. The HBM page table is `[B, hbm_pages_per_request]`; the DRAM table is `[B, dram_pages_per_request]`. The native LIM framework supports resident capacities `C=2048`, `4096`, and `8192`, using 16, 32, and 64 HBM pages per request respectively. Attention still selects 2048 tokens; a cold fill copies all C resident payloads.
 - FP16 or BF16 floating tensors; contiguous int32 metadata. Query, output, HBM cache, page tables, and metadata share one NPU. DRAM rows must be in the registered device-accessible host mapping used by the offload manager; arbitrary CPU allocations are unsupported.
 - `combined_hbm_cache` is contiguous `[pages, 128, 1, 576]`. TopK source/destination arrays are `[T, 1, 2048]`; per-query TopK miss counts are `[T]`. Request-union miss source/destination arrays are contiguous `[B, M]`, with `[B]` miss counts. `M` may be 32768 to pass native LIM buffers directly without packing a strided prefix into a separate workspace.
 - `attention_out` is caller-allocated and matches `query` shape and dtype. Active source IDs, slots, and block-table entries must be valid.
 
-The SGLang path is enabled with both `SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1` and `SGLANG_NPU_ENABLE_COPY_SFA=1`. Framework dispatch currently requires non-speculative Q1 decode, matching MLA/cache dimensions, and live sequence lengths of at least 2048 tokens (graph capture uses the framework's capture gate). Other calls use the existing attention path.
+The SGLang path is enabled with both `SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1` and `SGLANG_NPU_ENABLE_COPY_SFA=1`. Framework dispatch currently requires non-speculative Q1 decode, matching MLA/cache dimensions, and live sequence lengths of at least C tokens (graph capture uses the framework's capture gate). Shorter calls use the existing attention path and keep the original protection below 2048. C larger than TopK requires native LIM.
 
 For a Q1 graph batch containing padded rows, `actual_seq_lengths_query` remains the dense cumulative prefix `[1, 2, ..., B]` so each row keeps its output position. A padded row has zero KV/cache-token lengths and zero miss counts; its unused source/slot contents are not read. The kernel writes zero output for that row and leaves its cache state untouched.
 
@@ -25,6 +25,8 @@ The full-visible Q1 framework uses LIM as the only residency owner, passes its c
 `tests/test_copy_sfa_dynamic_tnd.py` covers heterogeneous query counts/cache budgets, dense-to-sparse graph transitions, mixed first-fill/steady misses, tail page crossings and poisoned future tails. `tests/test_lim_copy_sfa.py` retains full-visible partial-page/padding/reuse coverage for both packed and direct 32768-wide miss plans.
 
 Validated on Ascend A3 host 217 on 2026-10-23: a full normal-wheel build with CANN 9.1 and torch/torch_npu 2.10 completed, and all 53 selected native LIM, cache-planner and Copy-SFA tests passed. This is operator validation; it does not establish model-level MTP support or a model performance improvement.
+
+The merged capacity integration was validated on 2026-10-24 with 61 native tests, including C2048/4096/8192 crossed with eager/graph and packed/direct miss plans. Real-manager checks also covered all three capacities with 16 graph batch rows and three request storage rows, bitwise resident KV and an FP32 attention oracle. These fixtures do not establish GPQA accuracy or repair of long generation loops.
 
 ## Cache planner behavior
 

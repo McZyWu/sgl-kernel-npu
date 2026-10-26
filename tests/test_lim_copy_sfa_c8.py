@@ -12,7 +12,8 @@ from fused_quant_scatter_copy_sparse_flash_attention_golden import (
 
 
 @pytest.mark.parametrize("graph_replay", [False, True])
-def test_c8_lim_copy_sfa_lifecycle(graph_replay):
+@pytest.mark.parametrize("capacity", [2048, 4096, 8192])
+def test_c8_lim_copy_sfa_lifecycle(graph_replay, capacity):
     import acl
     import sgl_kernel_npu  # noqa: F401
     from sgl_kernel_npu.sparsity_driven_kv_offload import create_shm_tensor, free_shm
@@ -21,7 +22,8 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
         pytest.skip("C8 numerical integration requires Ascend950 (A5)")
     torch.npu.set_device(0)
     device = "npu:0"
-    batch, rows, context, capacity, physical = 4, 4, 4352, 2048, 2304
+    batch, rows, top_k = 4, 4, 2048
+    context, physical = 2 * capacity + 512, capacity + 256
     index_heads, query_heads = 32, 8
     generator = torch.Generator().manual_seed(20261023)
     host, _, pointer = create_shm_tensor(
@@ -74,7 +76,7 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
         states = torch.empty_like(lengths)
         hbm_lengths = torch.empty_like(lengths)
         pool = torch.full((rows, context), -1, dtype=torch.int32, device=device)
-        ids = torch.full((batch, 1, capacity), -1, dtype=torch.int32, device=device)
+        ids = torch.full((batch, 1, top_k), -1, dtype=torch.int32, device=device)
         slots = torch.full_like(ids, -1)
         topk_counts = torch.zeros_like(lengths)
         miss_src = torch.full((batch, 32768), -1, dtype=torch.int32, device=device)
@@ -169,7 +171,7 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
             key = torch.zeros(rows, context, 128)
             key[..., 0] = -8
             for request, length in ((1, a), (2, b), (3, c)):
-                key[request, max(0, length - capacity) : length, 0] = 8
+                key[request, max(0, length - top_k) : length, 0] = 8
                 # Framework writes dense identity KV and prefix-relative tail rows.
                 if length <= capacity:
                     hbm.view(rows, physical, 656)[request, :length].copy_(
@@ -183,7 +185,7 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
                 )
             index_key.copy_(key.to(torch.float8_e4m3fn).to(device))
 
-        prepare(2050, 4098, 130, reset=True)
+        prepare(capacity + 2, 2 * capacity + 2, 130, reset=True)
         enqueue()
         torch.npu.synchronize()
         graph = None
@@ -195,20 +197,21 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
             with torch.npu.graph(graph):
                 enqueue()
         for a, b, c, reset in (
-            (2050, 4098, 130, True),
-            (2051, 4099, 130, False),
-            (2177, 4225, 2049, True),
-            (2570, 3001, 130, True),
+            (capacity - 1, capacity, 130, True),
+            (capacity + 2, 2 * capacity + 2, 130, True),
+            (capacity + 3, 2 * capacity + 3, 130, False),
+            (capacity + 129, 2 * capacity + 129, capacity + 1, True),
+            (capacity + 266, capacity + 953, 130, True),
         ):
             prepare(a, b, c, reset)
             graph.replay() if graph is not None else enqueue()
             torch.npu.synchronize()
             ids_cpu, slots_cpu = ids.cpu(), slots.cpu()
             for row, request, length in ((0, 1, a), (2, 2, b), (3, 3, c)):
-                count = min(length, capacity)
+                count = min(length, top_k)
                 actual_ids = ids_cpu[row, 0, :count].long()
                 assert set(actual_ids.tolist()) == set(
-                    range(max(0, length - capacity), length)
+                    range(max(0, length - top_k), length)
                 )
                 actual_slots = slots_cpu[row, 0, :count].long()
                 torch.testing.assert_close(
@@ -217,6 +220,18 @@ def test_c8_lim_copy_sfa_lifecycle(graph_replay):
                     rtol=0,
                     atol=0,
                 )
+                if reset and ((length - 1) // 128) * 128 >= capacity:
+                    # A C>K cold fill must publish the entire resident cache,
+                    # while attention still consumes exactly K selected rows.
+                    assert miss_counts[row].item() == capacity
+                    sources = miss_src[row, :capacity].cpu().long()
+                    destinations = miss_dst[row, :capacity].cpu().long()
+                    torch.testing.assert_close(
+                        hbm.cpu().view(rows, physical, 656)[request, destinations],
+                        logical[request, sources],
+                        rtol=0,
+                        atol=0,
+                    )
                 key, value = unpack_rows(logical[request, actual_ids])
                 scores = attention_query[row].cpu().float() @ key.T * scale
                 expected = scores.softmax(-1) @ value
