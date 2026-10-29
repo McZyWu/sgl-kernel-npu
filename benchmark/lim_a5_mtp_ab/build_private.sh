@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build into a task-private package root; never replace the installed wheel.
-set -euo pipefail
+set -eo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(cd -- "$HERE/../.." && pwd)
@@ -15,6 +15,7 @@ mkdir -p -- "$BUILD_ARTIFACT_ROOT/logs"
 trap 'rc=$?; printf "%s\n" "$rc" > "$BUILD_ARTIFACT_ROOT/build.exitcode"' EXIT
 ASCEND_ENV=${ASCEND_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}
 source "$ASCEND_ENV"
+set -u
 export BUILD_ARTIFACT_ROOT SOURCE_ROOT SOC_VERSION
 "$PYTHON" - <<'PY' > "$BUILD_ARTIFACT_ROOT/source_provenance.json"
 import hashlib
