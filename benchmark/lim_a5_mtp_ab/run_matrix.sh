@@ -22,7 +22,8 @@ The caller must source the matching Ascend environment before execution.
 Required environment: KERNEL_PYTHON_ROOT, ASCEND_HOME_PATH,
 ASCEND_RT_VISIBLE_DEVICES. Select the visible device explicitly before use.
 Required original backend: ORIGINAL_LIM_BINDING or both ORIGINAL_MODULE and
-ORIGINAL_OP. The binding build requires the complete pinned vLLM-Ascend source.
+ORIGINAL_OP. build_private.sh prepares the pinned original operator privately;
+no full vLLM-Ascend checkout or Python package is required.
 EOF
 }
 
@@ -147,7 +148,8 @@ for case_id in "${CASE_IDS[@]}"; do
     for key in ASCEND_HOME_PATH ASCEND_TOOLKIT_HOME ASCEND_CUSTOM_OPP_PATH \
         ASCEND_RT_VISIBLE_DEVICES LD_LIBRARY_PATH KERNEL_PYTHON_ROOT \
         ORIGINAL_LIM_BINDING ORIGINAL_MODULE ORIGINAL_OP ORIGINAL_SOURCE_REVISION \
-        ORIGINAL_VARIANT ORIGINAL_OPP_ROOT; do
+        ORIGINAL_VARIANT ORIGINAL_OPP_ROOT ORIGINAL_BINDING_MANIFEST \
+        ORIGINAL_SOURCE_MANIFEST; do
       if [[ -n "${!key:-}" ]]; then printf 'export %s=%q\n' "$key" "${!key}"; fi
     done
     printf 'export PYTHONPATH=%q\n' "$PYTHONPATH"

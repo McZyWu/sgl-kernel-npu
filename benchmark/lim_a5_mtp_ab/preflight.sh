@@ -60,8 +60,8 @@ if [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
     | tee -a "$OUTPUT/preflight.log" >&2
   failures=1
 fi
-if [[ ! "$DEVICE" =~ ^npu:[0-9]+$ && ! "$DEVICE" =~ ^[0-9]+$ ]]; then
-  printf 'Device argument must be an explicit npu:N or N value.\n' | tee -a "$OUTPUT/preflight.log" >&2
+if [[ ! "$DEVICE" =~ ^npu:[0-9]+$ ]]; then
+  printf 'Device argument must be an explicit npu:N value.\n' | tee -a "$OUTPUT/preflight.log" >&2
   failures=1
 fi
 
@@ -70,7 +70,8 @@ fi
   printf 'device=%s\n' "$DEVICE"
   for key in ASCEND_HOME_PATH ASCEND_TOOLKIT_HOME ASCEND_CUSTOM_OPP_PATH \
       ASCEND_RT_VISIBLE_DEVICES KERNEL_PYTHON_ROOT PYTHONPATH LD_LIBRARY_PATH \
-      ORIGINAL_LIM_BINDING ORIGINAL_MODULE ORIGINAL_OP VLLM_ASCEND_SOURCE \
+      ORIGINAL_LIM_BINDING ORIGINAL_MODULE ORIGINAL_OP ORIGINAL_BINDING_MANIFEST \
+      ORIGINAL_SOURCE_MANIFEST \
       ORIGINAL_SOURCE_REVISION ORIGINAL_VARIANT ORIGINAL_OPP_ROOT ASCEND_ENV_SCRIPT; do
     if [[ -n "${!key:-}" ]]; then printf '%s=%s\n' "$key" "${!key}"; fi
   done
@@ -122,8 +123,6 @@ try:
     record["torch"] = torch.__version__
     record["torch_npu"] = torch_npu.__version__
     index = int(device.split(":", 1)[1]) if ":" in device else int(device)
-    if not torch_npu.npu.is_available():
-        raise RuntimeError("torch_npu reports no available NPU")
     torch.npu.set_device(index)
     record["device_name"] = torch.npu.get_device_name(index)
     record["soc_info"] = acl.rt.get_device_info(index, 601)

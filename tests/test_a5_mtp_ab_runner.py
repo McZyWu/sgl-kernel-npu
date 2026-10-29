@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -58,6 +59,17 @@ class PoolValidation(unittest.TestCase):
         spec.loader.exec_module(cls.module)
         cls.module.B, cls.module.K, cls.module.C = 1, 2, 2
         cls.module.PREFIX, cls.module.ACTUAL = 4, 6
+
+    def test_tarball_source_does_not_inherit_enclosing_git_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", str(root)], capture_output=True, check=True)
+            extracted = root / "extracted"
+            extracted.mkdir()
+            provenance = self.module.source_provenance(extracted)
+            self.assertIsNone(provenance["source_commit"])
+            self.assertIsNone(provenance["source_dirty_diff_sha256"])
+            self.assertIn("no matching Git root", provenance["source_dirty_diff_scope"])
 
     def test_exact_pool_delta_and_rejection(self):
         module = self.module

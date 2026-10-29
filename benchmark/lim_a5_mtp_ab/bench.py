@@ -33,6 +33,39 @@ INVALID = -(1 << 31)
 utc_timezone = timezone.utc  # noqa: UP017 - preserve Python 3.10 support
 
 
+def source_provenance(repo):
+    """Record this source tree without attributing a tarball to an enclosing repo."""
+
+    def git(*argv):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), *argv], capture_output=True, check=False
+            )
+        except OSError:
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    top = git("rev-parse", "--show-toplevel")
+    matches = bool(top and Path(top.decode().strip()).resolve() == repo.resolve())
+    revision = git("rev-parse", "HEAD") if matches else None
+    status = git("status", "--porcelain") if matches else None
+    diff = git("diff", "--binary", "HEAD") if matches else None
+    return {
+        "source_commit": revision.decode().strip() if revision else None,
+        "source_dirty_diff_sha256": (
+            hashlib.sha256(diff).hexdigest() if diff is not None else None
+        ),
+        "source_status_porcelain": (
+            status.decode(errors="replace") if status is not None else None
+        ),
+        "source_dirty_diff_scope": (
+            "git diff --binary HEAD; untracked files are listed in status but not in diff hash"
+            if matches
+            else "no matching Git root; script and library hashes are recorded separately"
+        ),
+    }
+
+
 def case_id(case):
     return f"q{case['q']}_{case['mode']}_{case['policy']}_hit{case['hit_percent']}"
 
@@ -316,13 +349,7 @@ def run(args, case, out):
             buffers[name][0].copy_(seed_pool)
 
     repo = Path(__file__).resolve().parents[2]
-
-    def git(*argv):
-        return subprocess.run(
-            ["git", "-C", str(repo), *argv], capture_output=True, check=True
-        ).stdout
-
-    diff = git("diff", "--binary", "HEAD")
+    source = source_provenance(repo)
     versions["original_compile_variant"] = args.original_variant
     versions["original_source_revision_hint"] = args.original_source_revision
     versions["sglang_compile_variant"] = (
@@ -386,12 +413,7 @@ def run(args, case, out):
         "script_sha256": file_sha(Path(__file__)),
         "backend_script_sha256": file_sha(Path(__file__).with_name("backends.py")),
         "fixture_script_sha256": file_sha(Path(__file__).with_name("fixture.py")),
-        "source_commit": git("rev-parse", "HEAD").decode().strip(),
-        "source_dirty_diff_sha256": hashlib.sha256(diff).hexdigest(),
-        "source_status_porcelain": git("status", "--porcelain").decode(
-            errors="replace"
-        ),
-        "source_dirty_diff_scope": "git diff --binary HEAD; untracked files are listed in status but not in diff hash",
+        **source,
         "started_at_utc": datetime.now(utc_timezone).isoformat(),
         "started_at_epoch_seconds": datetime.now(utc_timezone).timestamp(),
     }

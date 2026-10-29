@@ -5,7 +5,8 @@
 | A3、A5分工作区和分支 | ✅ 已隔离 | 本目录属于A5分支；不修改A3工作区 |
 | A5算子级MTP3调用适配 | ✅ 已准备 | 现有A5原语已支持Q1–Q14；驱动将MTP0映射到Q1、MTP3映射到Q4，无需改已有ABI |
 | 保持非MTP默认行为 | ✅ 源码保持 | 本次仅新增benchmark和CPU测试，不改Q1内核、注册或构建默认值 |
-| 原生LI、vLLM原版LIM、SGLang迁移LIM | ✅ 三入口驱动 | A5 FP8量化算子；原版设备OPP需在容器中已经安装 |
+| 原生LI、PR原版LIM、SGLang迁移LIM | ✅ 三入口驱动 | 随包准备固定PR的原版源码和私有OPP构建，不要求完整vLLM源码或Python包 |
+| 容器依赖检查与构建工具 | ✅ 提供入口 | doctor默认不初始化设备；bootstrap只安装私有Python构建工具，CANN和A5适配的torch需容器提供 |
 | 16种配置与原始样本 | ✅ 已实现 | MTP0/3×Eager/Graph×低ID/分散filler×91%/95%，每项三个后端 |
 | A5编译、正确性与性能结论 | ⏳ 待手动运行 | 当前交付机是Windows，没有A5设备；未产生A5实测数值 |
 | 中文结果与点线图 | ✅ 生成器已准备 | 运行后生成；没有数据时明确显示缺失，不填A3或模拟性能 |
@@ -61,13 +62,23 @@ TND/PA_BSND、quant mode0、sparse mode3。不能用A3 BF16 LI充当A5参考。
 
 - 迁移基线：个人fork原A5分支`feat/hisparse-lim-copysfa-c8-a5-10-26`，
   本次改动前提交`2765f232a8317d18025f1939aee3207ff215c794`。
-- 原A5实现来源：vLLM Ascend PR18383；本仓`UPSTREAM_PROVENANCE.json`保存原版来源和文件SHA。
+- 原版LIM来源：[vLLM Ascend PR18383](https://github.com/vllm-project/vllm-ascend/pull/18383)，
+  固定提交`7d5a4cd9d7e8c4e2e4f0f6415a71f0e80edcff8e`。
+- 原版Copy-SFA来源：[PR18490](https://github.com/vllm-project/vllm-ascend/pull/18490)，
+  固定提交`1b180deb840484c2fe33cbdd7abb68a615085172`。这是另一个算子，本次LI/LIM计时不包含它。
+- 以上版本与当前分支两份`UPSTREAM_PROVENANCE.json`一致。归档保留原文件字节、许可证、
+  每文件SHA和来源；不在A5容器下载整个vLLM仓库，也不安装vLLM Python依赖。
+- 原版LIM设备/host源码保留原字节；准备器只补两份未选中类别的空CMake目录。
+  包中另附json、Abseil、protobuf和makeself构建依赖。CANN的补丁版makeself下载返回401，
+  因此包使用官方makeself 2.5.0打包器；已核对所需参数，但未验证A5安装过程。
+  这个差别属于安装包生成工具，来源、SHA与限制见`vendor/README.md`和准备manifest。
 - 旧提交保留标记：`lim-a5-before-mtp-manual-20261029`；新内容以追加commit交付。
 
 **现有迁移版CMake明确编译vector后处理**：`LIM_SIMT_POSTPROCESS=0`、
 `LIM_SIMT_VICTIM_UNPACK=0`。原版默认可能是SIMT，需要额外的UB启动预留。
-本次不更改这些默认值，避免影响非MTP路径。请把原版实际编译配置填写到
-`ORIGINAL_VARIANT`；不知道就保留`unknown`。这组配置未对齐时，测到的是部署版本
+本次不更改这些默认值，避免影响非MTP路径。随包构建会记录原版源码、构建命令和
+OPP来源，并设置`ORIGINAL_VARIANT`；若自行接入其他原版库，不知道其配置时保留
+`unknown`。这组配置未对齐时，测到的是部署版本
 的对照，不能仅凭差值归因于迁移算法本身。
 
 ## 在A5容器准备
@@ -89,36 +100,57 @@ git rev-parse HEAD
 再在所需网络或已有依赖条件下执行`git submodule update --init --recursive`。
 bundle保留源提交和子模块指针，不包含CANN、驱动、权重或子模块远端仓库。
 
-容器需要匹配的A5驱动/CANN开发环境、支持FP8量化LI的torch/torch_npu、C++工具链、
-pip、ninja，以及已安装的**原版A5量化LIM设备OPP**。
-`build_original_binding.py`只编译原版调用封装，不会编译或安装原版设备kernel。
-若原版OPP不存在，先按你原版vLLM分支自己的构建说明安装；本包不会自动换成迁移版。
+容器需要Python 3.10或更新版本、匹配的A5驱动/CANN开发环境、支持FP8量化LI的torch/torch_npu和C++工具链。
+本包负责准备原版源码、构建原版设备OPP和独立Torch封装。原版走自己的ACLNN/OPP，
+迁移版走当前SGLang直接启动入口。
+
+### 先检查镜像缺什么
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python3 benchmark/lim_a5_mtp_ab/doctor.py --output /work/a5-doctor.json
+```
+
+此命令默认只读软件环境，不导入torch_npu、不创建设备context。缺少构建工具时，
+可继续下一步在私有venv补齐。缺少CANN开发文件、A5适配的torch/torch_npu时，
+输出会明确列出；这些无法靠普通pip构建依赖补齐，必须使用与你的A5环境匹配的供应方包。
+这里没有足够依据指定一个保证可用的镜像标签或盲装某个torch版本。
+
+```bash
+bash benchmark/lim_a5_mtp_ab/bootstrap_deps.sh /work/a5-lim-tools-001
+source /work/a5-lim-tools-001/paths.env
+# 无外网时，在上一条bootstrap命令末尾增加：--wheelhouse /work/build-wheels
+python3 benchmark/lim_a5_mtp_ab/doctor.py --output /work/a5-doctor-after.json
+```
+
+私有venv继承容器已安装的torch/torch_npu，只补小型构建工具，不替换系统框架或CANN。
+默认工具为CMake 3.30.5、Ninja 1.11.1、wheel 0.45.1；这些是构建工具版本，
+不表示已确认某一组A5运行时兼容性。补充工具可用`--requirements`传入构建专用版本清单。
+第一次doctor失败日志应保留，用于对照实际补齐的项目。构建前doctor必须通过。
 
 ### 构建到私有目录
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-# 填写你已核对的原版vLLM Ascend源码目录，须含PR18383量化LIM及其ACLNN adapter。
-export VLLM_ASCEND_SOURCE=/work/vllm-ascend
-# 按原版OPP安装情况配置，保留其官方环境脚本生成的路径。
-# export ASCEND_CUSTOM_OPP_PATH=/your/verified/vendor/opp
+source /work/a5-lim-tools-001/paths.env
 
 bash benchmark/lim_a5_mtp_ab/build_private.sh /work/a5-lim-build-001
 source /work/a5-lim-build-001/paths.env
 ```
 
-`build_private.sh`运行`bash build.sh -a kernels Ascend950`，把wheel安装到新目录
+`build_private.sh`在本次私有源码副本运行`bash build.sh -a kernels Ascend950`，把wheel安装到新目录
 `/work/a5-lim-build-001/kernel_runtime`，不覆盖容器全局wheel。
-如果设置了`VLLM_ASCEND_SOURCE`，它还会编译独立`a5_original_lim.run`封装，
-原样调用原版A5 ACLNN，并输出库SHA、原版source revision和来源manifest。
+它还会校验随包源码，构建PR18383的原版OPP，安装到本次新建目录，再编译独立
+`a5_original_lim.run`封装，输出库SHA、原版source revision和来源manifest。
+不用设置`VLLM_ASCEND_SOURCE`，也不要求预先安装原版OPP。
+原版启动前还会用原adapter相同的解析器检查两个`WithStrides`符号实际来自哪个共享库，
+要求都位于本次私有OPP目录，并记录路径与SHA；解析到其他安装时立即失败。
 
-也可只构建封装：
+也可只准备和构建原版：
 
 ```bash
-python3 benchmark/lim_a5_mtp_ab/build_original_binding.py \
-  --source-root "$VLLM_ASCEND_SOURCE" \
-  --build-dir /work/a5-original-binding-001
-export ORIGINAL_LIM_BINDING=/work/a5-original-binding-001/a5_original_lim_binding.so
+bash benchmark/lim_a5_mtp_ab/build_original.sh /work/a5-original-001
+source /work/a5-original-001/paths.env
 ```
 
 若容器已有原版扩展，可通过`ORIGINAL_MODULE`和`ORIGINAL_OP`选择原版注册入口，
@@ -155,7 +187,7 @@ smoke只做最小诊断，不会被报告算作正式性能。若TopK集合不�
 ### 正式16配置
 
 ```bash
-export ORIGINAL_VARIANT=unknown  # 核实原版编译宏后填写，不能凭源码默认推定实际二进制。
+# 使用build_private生成的paths.env，保留其原版版本与构建变体记录。
 bash benchmark/lim_a5_mtp_ab/run_matrix.sh \
   --output-root /work/a5-lim-results-001 --device npu:0 \
   --warmup 20 --rounds 3 --iterations 50 \
@@ -190,7 +222,9 @@ bash benchmark/lim_a5_mtp_ab/run_matrix.sh \
 ```
 
 构建日志在`/work/a5-lim-build-001/logs/`，总退出码为`build.exitcode`。
-原版封装manifest在`original_binding/binding_manifest.json`，迁移wheel来源在
+原版完整打屏为`original/build.log`，退出码为`original/exit_code`；
+构建工具准备日志为`/work/a5-lim-tools-001/bootstrap.log`和`bootstrap.exitcode`。
+原版构建与封装manifest位于`original/`，迁移wheel来源在
 `source_provenance.json`和`wheel.json`。实际输出文件名以脚本和报告索引为准。
 
 重新生成报告：

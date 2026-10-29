@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -58,6 +59,23 @@ def load_backends(args):
         raise RuntimeError(f"SGLang library was not registered by torch: {sgl_library}")
     if args.original_library:
         torch.ops.load_library(str(Path(args.original_library).resolve(strict=True)))
+    binding_manifest = None
+    if os.environ.get("ORIGINAL_BINDING_MANIFEST"):
+        manifest_path = Path(os.environ["ORIGINAL_BINDING_MANIFEST"]).resolve(
+            strict=True
+        )
+        binding_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not args.original_library or binding_manifest.get(
+            "library_sha256"
+        ) != file_sha(args.original_library):
+            raise RuntimeError(
+                "original binding manifest does not match selected library"
+            )
+        binding_manifest = {
+            "path": str(manifest_path),
+            "sha256": file_sha(manifest_path),
+            "contents": binding_manifest,
+        }
     if args.original_module:
         importlib.import_module(args.original_module)
     namespace, sep, name = args.original_op.partition(".")
@@ -83,6 +101,30 @@ def load_backends(args):
         raise RuntimeError(
             "original and SGLang must use distinct operator registrations"
         )
+    resolved_original_libraries = None
+    if args.original_op == "a5_original_lim.run":
+        selected_opp = args.original_opp_root or os.environ.get("ORIGINAL_OPP_ROOT")
+        if not selected_opp:
+            raise RuntimeError(
+                "the packaged original wrapper requires ORIGINAL_OPP_ROOT"
+            )
+        opp_root = Path(selected_opp).resolve(strict=True)
+        resolved_original_libraries = []
+        for symbol, library in dict(
+            torch.ops.a5_original_lim.resolve_libraries()
+        ).items():
+            library_path = Path(library).resolve(strict=True)
+            if opp_root not in library_path.parents:
+                raise RuntimeError(
+                    f"original {symbol} resolved outside private OPP: {library_path}"
+                )
+            resolved_original_libraries.append(
+                {
+                    "symbol": symbol,
+                    "path": str(library_path),
+                    "sha256": file_sha(library_path),
+                }
+            )
     torch.npu.set_device(args.device)
     device_index = torch.device(args.device).index or 0
     soc = acl.rt.get_device_info(device_index, 601)
@@ -111,6 +153,8 @@ def load_backends(args):
                 else None
             ),
             "original_module": args.original_module,
+            "original_binding_manifest": binding_manifest,
+            "original_resolved_aclnn_libraries": resolved_original_libraries,
             "original_op": args.original_op,
             "torch": torch.__version__,
             "torch_npu": getattr(torch_npu, "__version__", None),

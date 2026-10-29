@@ -16,6 +16,8 @@ repos:
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        # Pinned offline build dependencies are checked by prepare_original.py.
+        exclude: ^benchmark/lim_a5_mtp_ab/vendor/(abseil-cpp-20230802\.1|protobuf-25\.1)\.tar\.gz$
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
