@@ -228,6 +228,36 @@ bash benchmark/lim_a5_mtp_ab/run_matrix.sh \
 失败会保留日志并停止余下case；报告把未运行项标为缺失，不填0。每次重跑使用
 新的输出根目录，避免覆盖证据。正式模式与smoke分开。
 
+### preflight失败时
+
+预检失败会在16个case开始前停止，所以报告中的全部`missing`表示尚未执行。
+终端会显示失败检查、实际退出码、原始日志路径和有长度限制的日志末尾；
+Python探针失败时也显示其traceback。映射、基本设备信息和Python/NPU探针检查保留。
+
+当前A5驱动的命令语法为`npu-smi info -m`查询映射、`npu-smi info proc`查询滚动进程信息。
+旧版脚本的顶层`npu-smi -m`及`npu-smi info -t proc`会打印帮助或报参数错误，已修正。
+进程查询限时采集5秒，非0（包括采集限时到达）只记录；没有timeout工具时记录未采集，
+不会启动无界滚动查询。映射、基本信息和Python探针失败仍阻止正式case运行。
+
+原始文件位于`<结果根>/preflight/`：`preflight.log`记录环境/路径问题，
+`npu-smi_info_-m.log`和`npu-smi_info.log`保存对应命令输出及退出码，
+`python-probe.log`和`runtime.json`保存Python/NPU探针结果。
+进程采集结果在`npu-smi_info_proc.log`，不单独导致预检失败。
+
+旧版本只打印`Preflight failed`时，可直接读这些已有日志，不需要重跑矩阵：
+
+```bash
+preflight_dir=/work/a5-lim-results-001/preflight
+for name in preflight.log npu-smi_-m.log npu-smi_info_-m.log npu-smi_info.log python-probe.log runtime.json; do
+  if [ -f "$preflight_dir/$name" ]; then
+    printf '\n=== %s ===\n' "$name"
+    tail -n 100 "$preflight_dir/$name"
+  fi
+done
+```
+
+保留失败目录。找到并处理实际原因后，再用新的输出目录重试；不要删除日志或跳过检查。
+
 ## 如何看结果与打屏日志
 
 以`q4_graph_low_hit91`为例：

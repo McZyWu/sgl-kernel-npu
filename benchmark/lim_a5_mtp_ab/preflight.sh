@@ -25,31 +25,45 @@ if [[ -e "$OUTPUT" ]]; then
   exit 2
 fi
 mkdir -p "$OUTPUT"
+OUTPUT="$(cd "$OUTPUT" && pwd)"
+PREFLIGHT_LOG="$OUTPUT/preflight.log"
+: > "$PREFLIGHT_LOG"
+
+report_failure() {
+  local check="$1" rc="$2" log_path="$3"
+  printf 'FAILED check=%s exit_code=%s log=%s\n' "$check" "$rc" "$log_path" \
+    | tee -a "$PREFLIGHT_LOG" >&2 || true
+  if [[ -f "$log_path" ]]; then
+    printf '%s\n' "--- last 60 lines: $log_path ---" | tee -a "$PREFLIGHT_LOG" >&2 || true
+    tail -n 60 "$log_path" | tee -a "$PREFLIGHT_LOG" >&2 || true
+    printf '%s\n' '--- end log tail ---' | tee -a "$PREFLIGHT_LOG" >&2 || true
+  fi
+}
 
 failures=0
 for required in ASCEND_HOME_PATH ASCEND_RT_VISIBLE_DEVICES KERNEL_PYTHON_ROOT; do
   if [[ -z "${!required:-}" ]]; then
-    printf 'Missing required environment variable: %s\n' "$required" | tee -a "$OUTPUT/preflight.log" >&2
+    printf 'Missing required environment variable: %s\n' "$required" | tee -a "$PREFLIGHT_LOG" >&2
     failures=1
   fi
 done
 if [[ -n "${ORIGINAL_LIM_BINDING:-}" && ! -f "$ORIGINAL_LIM_BINDING" ]]; then
-  printf 'ORIGINAL_LIM_BINDING does not exist: %s\n' "$ORIGINAL_LIM_BINDING" | tee -a "$OUTPUT/preflight.log" >&2
+  printf 'ORIGINAL_LIM_BINDING does not exist: %s\n' "$ORIGINAL_LIM_BINDING" | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 fi
 if [[ -z "${ORIGINAL_LIM_BINDING:-}" && ( -z "${ORIGINAL_MODULE:-}" || -z "${ORIGINAL_OP:-}" ) ]]; then
-  printf 'Set ORIGINAL_LIM_BINDING or both ORIGINAL_MODULE and ORIGINAL_OP.\n' | tee -a "$OUTPUT/preflight.log" >&2
+  printf 'Set ORIGINAL_LIM_BINDING or both ORIGINAL_MODULE and ORIGINAL_OP.\n' | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 fi
 if [[ -n "${KERNEL_PYTHON_ROOT:-}" && ! -d "$KERNEL_PYTHON_ROOT" ]]; then
-  printf 'KERNEL_PYTHON_ROOT does not exist: %s\n' "$KERNEL_PYTHON_ROOT" | tee -a "$OUTPUT/preflight.log" >&2
+  printf 'KERNEL_PYTHON_ROOT does not exist: %s\n' "$KERNEL_PYTHON_ROOT" | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 fi
 if [[ -n "${ASCEND_CUSTOM_OPP_PATH:-}" ]]; then
   IFS=':' read -r -a opp_paths <<< "$ASCEND_CUSTOM_OPP_PATH"
   for opp_path in "${opp_paths[@]}"; do
     if [[ -n "$opp_path" && ! -d "$opp_path" ]]; then
-      printf 'ASCEND_CUSTOM_OPP_PATH entry does not exist: %s\n' "$opp_path" | tee -a "$OUTPUT/preflight.log" >&2
+      printf 'ASCEND_CUSTOM_OPP_PATH entry does not exist: %s\n' "$opp_path" | tee -a "$PREFLIGHT_LOG" >&2
       failures=1
     fi
   done
@@ -57,11 +71,11 @@ fi
 
 if [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
   printf 'ASCEND_RT_VISIBLE_DEVICES must be set by the operator; no device is selected automatically.\n' \
-    | tee -a "$OUTPUT/preflight.log" >&2
+    | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 fi
 if [[ ! "$DEVICE" =~ ^npu:[0-9]+$ ]]; then
-  printf 'Device argument must be an explicit npu:N value.\n' | tee -a "$OUTPUT/preflight.log" >&2
+  printf 'Device argument must be an explicit npu:N value.\n' | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 fi
 
@@ -78,10 +92,10 @@ fi
 } > "$OUTPUT/environment.txt"
 
 if ! command -v npu-smi >/dev/null 2>&1; then
-  printf 'npu-smi is unavailable.\n' | tee -a "$OUTPUT/preflight.log" >&2
+  printf 'npu-smi is unavailable.\n' | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 else
-  for entry in 'npu-smi -m' 'npu-smi info' 'npu-smi info -t proc'; do
+  for entry in 'npu-smi info' 'npu-smi info -m'; do
     file_name="$(printf '%s' "$entry" | tr ' /' '__').log"
     printf '$ %s\n' "$entry" | tee -a "$OUTPUT/preflight.log"
     set +e
@@ -89,8 +103,28 @@ else
     rc=$?
     set -e
     printf 'exit_code=%s\n' "$rc" >> "$OUTPUT/$file_name"
-    if ((rc != 0)) && [[ "$entry" != 'npu-smi info -t proc' ]]; then failures=1; fi
+    if ((rc != 0)); then
+      failures=1
+      report_failure "$entry" "$rc" "$OUTPUT/$file_name"
+    fi
   done
+
+  process_log="$OUTPUT/npu-smi_info_proc.log"
+  process_command='timeout 5s npu-smi info proc'
+  if command -v timeout >/dev/null 2>&1; then
+    printf '$ %s\n' "$process_command" | tee -a "$PREFLIGHT_LOG"
+    printf '$ %s\n' "$process_command" > "$process_log"
+    set +e
+    timeout 5s npu-smi info proc >> "$process_log" 2>&1
+    rc=$?
+    set -e
+    printf 'exit_code=%s\n' "$rc" >> "$process_log"
+  else
+    printf 'command=%s\nunavailable=timeout command not found\nexit_code=unavailable\n' \
+      "$process_command" > "$process_log"
+    printf 'Nonfatal: timeout unavailable; skipped npu-smi info proc. Log: %s\n' \
+      "$process_log" | tee -a "$PREFLIGHT_LOG" >&2
+  fi
 fi
 
 if command -v ldconfig >/dev/null 2>&1; then
@@ -101,7 +135,7 @@ fi
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then python_bin="$PYTHON_BIN"; else python_bin=python3; fi
 if ! command -v "$python_bin" >/dev/null 2>&1; then
-  printf 'Python executable unavailable: %s\n' "$python_bin" | tee -a "$OUTPUT/preflight.log" >&2
+  printf 'Python executable unavailable: %s\n' "$python_bin" | tee -a "$PREFLIGHT_LOG" >&2
   failures=1
 else
   set +e
@@ -153,7 +187,10 @@ print(json.dumps(record, indent=2))
 PY
   rc=$?
   set -e
-  if ((rc != 0)); then failures=1; fi
+  if ((rc != 0)); then
+    failures=1
+    report_failure "python runtime probe" "$rc" "$OUTPUT/python-probe.log"
+  fi
 fi
 
 if ((failures)); then
