@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parents[1] / "benchmark" / "lim_a5_mtp_ab"
 SHELL = BASE / "build_original.sh"
 BINDING = BASE / "build_original_binding.py"
+MAKESELF_ARCHIVE = BASE / "vendor" / "makeself-upstream-2.5.0.tar.gz"
 BASH = shutil.which("bash")
 if not BASH and os.name == "nt":
     candidate = Path("C:/Program Files/Git/bin/bash.exe")
@@ -97,6 +99,75 @@ class ShellPreflight(unittest.TestCase):
             self.assertFalse((output / "paths.env").exists())
             self.assertFalse((donor / "csrc" / "build").exists())
 
+    def test_upstream_makeself_requires_separator_for_installer_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            makeself_root = base / "makeself"
+            with tarfile.open(MAKESELF_ARCHIVE, "r:gz") as archive:
+                archive.extractall(makeself_root, filter="data")
+            makeself = makeself_root / "makeself-release-2.5.0" / "makeself.sh"
+            payload = base / "payload"
+            payload.mkdir()
+            received = base / "received-args.txt"
+            startup = payload / "install.sh"
+            startup.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > "
+                + repr(received.as_posix())
+                + "\n",
+                encoding="utf-8",
+            )
+            chmod = subprocess.run(
+                [BASH, "-c", 'chmod +x "$1"', "bash", str(startup)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(chmod.returncode, 0, chmod.stderr)
+            installer = base / "installer.run"
+            created = subprocess.run(
+                [
+                    BASH,
+                    str(makeself),
+                    str(payload),
+                    str(installer),
+                    "test",
+                    "./install.sh",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr + created.stdout)
+
+            install_root = base / "private-opp"
+            without_separator = subprocess.run(
+                [BASH, str(installer), f"--install-path={install_root}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(without_separator.returncode, 0)
+            self.assertIn(
+                "Unrecognized flag", without_separator.stderr + without_separator.stdout
+            )
+            self.assertFalse(received.exists())
+
+            with_separator = subprocess.run(
+                [BASH, str(installer), "--", f"--install-path={install_root}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                with_separator.returncode,
+                0,
+                with_separator.stderr + with_separator.stdout,
+            )
+            self.assertEqual(
+                received.read_text(encoding="utf-8").strip(),
+                f"--install-path={install_root}",
+            )
+
     def test_mock_build_installs_only_into_private_root(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -109,6 +180,8 @@ mkdir -p build
 cat > build/fake.run <<'INSTALLER'
 #!/bin/bash
 set -e
+[[ $1 == -- ]] || exit 32
+shift
 case "$1" in --install-path=*) root=${1#--install-path=} ;; *) exit 33 ;; esac
 vendor="$root/vendors/a5limbaseline_transformer"
 mkdir -p "$vendor/bin" "$vendor/op_api/lib"

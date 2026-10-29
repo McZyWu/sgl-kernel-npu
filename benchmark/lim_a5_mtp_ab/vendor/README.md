@@ -43,6 +43,12 @@ patched makeself build is required for release parity, replace this one
 packaging dependency with its authenticated archive before making a result
 claim.
 
+The standard makeself runtime requires `--` before embedded installer options:
+`bash package.run -- --install-path=/absolute/private/path`. Without that
+separator, it rejects `--install-path` before the embedded CANN script starts.
+`build_original.sh` and `recover_private.sh` use the separator. A CPU regression
+creates and runs a real archive with this vendored makeself release.
+
 The CANN CMake dependency patches for Abseil and protobuf are preserved without
 modification in the source bundle. CPU-side patch syntax/application was
 checked against the corresponding upstream source tags. A5 compilation,

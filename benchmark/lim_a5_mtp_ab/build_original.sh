@@ -95,7 +95,8 @@ install_root="$output/opp"
 mkdir -- "$install_root"
 installer=${installers[0]}
 printf 'Installing %s into private %s\n' "$installer" "$install_root"
-bash "$installer" "--install-path=$install_root"
+# Makeself consumes options before `--`; keep installer-specific flags after it.
+bash "$installer" -- "--install-path=$install_root"
 vendor="$install_root/vendors/a5limbaseline_transformer"
 vendor_env="$vendor/bin/set_env.bash"
 [[ -f "$vendor_env" ]] || { echo "Missing installed donor vendor environment: $vendor_env" >&2; exit 1; }

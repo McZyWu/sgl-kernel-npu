@@ -8,7 +8,7 @@
 | 原生LI、PR原版LIM、SGLang迁移LIM | ✅ 三入口驱动 | 随包准备固定PR的原版源码和私有OPP构建，不要求完整vLLM源码或Python包 |
 | 容器依赖检查与构建工具 | ✅ 提供入口 | doctor默认不初始化设备；bootstrap只安装私有Python构建工具，CANN和A5适配的torch需容器提供 |
 | 16种配置与原始样本 | ✅ 已实现 | MTP0/3×Eager/Graph×低ID/分散filler×91%/95%，每项三个后端 |
-| A5编译、正确性与性能结论 | ⏳ 待手动运行 | 当前交付机是Windows，没有A5设备；未产生A5实测数值 |
+| A5编译、正确性与性能结论 | ⏳ 部分构建已有用户日志 | SGLang wheel和原版OPP包已生成；原版安装参数错误已修复，wrapper及设备测试仍待手动验证 |
 | 中文结果与点线图 | ✅ 生成器已准备 | 运行后生成；没有数据时明确显示缺失，不填A3或模拟性能 |
 
 ## 实验回答的问题
@@ -134,7 +134,7 @@ python3 benchmark/lim_a5_mtp_ab/doctor.py --output /work/a5-doctor-after.json
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /work/a5-lim-tools-001/paths.env
 
-bash benchmark/lim_a5_mtp_ab/build_private.sh /work/a5-lim-build-001
+bash benchmark/lim_a5_mtp_ab/build_private.sh /work/a5-lim-build-001 &&
 source /work/a5-lim-build-001/paths.env
 ```
 
@@ -146,10 +146,37 @@ source /work/a5-lim-build-001/paths.env
 原版启动前还会用原adapter相同的解析器检查两个`WithStrides`符号实际来自哪个共享库，
 要求都位于本次私有OPP目录，并记录路径与SHA；解析到其他安装时立即失败。
 
+### 已生成wheel和原版.run，安装参数报错时恢复
+
+若旧版本最后显示：
+
+```text
+Unrecognized flag : --install-path=/work/a5-lim-build-001/original/opp
+build_original exit code: 1
+```
+
+这是标准makeself的外层参数解析拒绝了应传给内层CANN安装脚本的参数。安装调用
+已修为`bash "$installer" -- "--install-path=$install_root"`，不修改算子实现。
+已有的wheel和`.run`可复用，更新到修复提交后执行：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+bash benchmark/lim_a5_mtp_ab/recover_private.sh \
+  /work/a5-lim-build-001 /work/a5-lim-recover-001 &&
+source /work/a5-lim-recover-001/paths.env
+```
+
+此命令只在新的恢复目录安装原版OPP、编译wrapper并生成组合路径；复用旧目录中
+的SGLang运行库，不重编SG、原版OPP、protobuf或Abseil。旧目录和失败日志保留。
+恢复打屏在新目录的`recover.log`，最终退出码为`recover.exitcode`。失败后继续保留该目录，
+下次换新恢复目录。仅在恢复退出0并生成新`paths.env`后进入后面的smoke/正式测试。
+请在同一容器和Python环境执行；`--python`可显式指定与原wheel构建一致的解释器。
+恢复不初始化NPU context。
+
 也可只准备和构建原版：
 
 ```bash
-bash benchmark/lim_a5_mtp_ab/build_original.sh /work/a5-original-001
+bash benchmark/lim_a5_mtp_ab/build_original.sh /work/a5-original-001 &&
 source /work/a5-original-001/paths.env
 ```
 
