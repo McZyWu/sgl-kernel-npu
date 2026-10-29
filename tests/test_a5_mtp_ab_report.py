@@ -17,16 +17,23 @@ SPEC.loader.exec_module(REPORT)
 
 
 def payload(case_id: str, *, diagnostic_only: bool = False) -> dict:
-    q = 1 if case_id.startswith("q1_") else 4
+    q_text, mode, policy, hit_text = case_id.split("_")
+    q = int(q_text[1:])
+    hit = int(hit_text.removeprefix("hit"))
+    graph_replay = {
+        "passed": True,
+        "request_miss_counts": [[0] * q],
+        "route_miss_counts": [[0] * q],
+    }
     return {
         "schema_version": 1,
         "case_id": case_id,
         "case": {
             "q": q,
             "mtp": q - 1,
-            "mode": "eager",
-            "policy": "low",
-            "hit_percent": 91,
+            "mode": mode,
+            "policy": policy,
+            "hit_percent": hit,
             "hit_rate_basis": "selected_prefix_union",
         },
         "status": "ok",
@@ -43,7 +50,17 @@ def payload(case_id: str, *, diagnostic_only: bool = False) -> dict:
             "reference_sha256": "reference-a",
             "residency_sha256": "pool-a",
         },
-        "correctness": {name: {"passed": True} for name in REPORT.BACKENDS},
+        "correctness": {
+            name: {
+                "passed": True,
+                **(
+                    {"graph_replay": graph_replay}
+                    if mode == "graph" and name in ("original", "sglang")
+                    else {}
+                ),
+            }
+            for name in REPORT.BACKENDS
+        },
         "rounds": [
             {
                 "round": index,
@@ -60,6 +77,58 @@ def payload(case_id: str, *, diagnostic_only: bool = False) -> dict:
 
 
 class ReportTests(unittest.TestCase):
+    def test_runner_graph_replay_details_are_measured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "q1_graph_low_hit91"
+            (case_dir / "runner").mkdir(parents=True)
+            (case_dir / "status").write_text("0\n", encoding="utf-8")
+            data = payload("q1_graph_low_hit91")
+            (case_dir / "runner" / "case.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+            loaded, status = REPORT.load_case(case_dir)
+
+        self.assertEqual(status, "measured")
+        self.assertIsNotNone(loaded)
+
+    def test_graph_replay_accepts_legacy_true_and_rejects_invalid_values(self) -> None:
+        invalid_values = (
+            False,
+            None,
+            {},
+            {"other": True},
+            {"passed": False},
+            {"passed": 1},
+            {"passed": "true"},
+            "yes",
+            1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "q1_graph_low_hit91"
+            (case_dir / "runner").mkdir(parents=True)
+            (case_dir / "status").write_text("0\n", encoding="utf-8")
+            data = payload("q1_graph_low_hit91")
+            result_path = case_dir / "runner" / "case.json"
+            for backend in ("original", "sglang"):
+                data["correctness"][backend]["graph_replay"] = True
+            result_path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(REPORT.load_case(case_dir)[1], "measured")
+
+            for invalid in invalid_values:
+                for backend in ("original", "sglang"):
+                    data["correctness"][backend]["graph_replay"] = invalid
+                result_path.write_text(json.dumps(data), encoding="utf-8")
+                self.assertEqual(
+                    REPORT.load_case(case_dir)[1],
+                    "failed",
+                    msg=f"accepted invalid graph_replay value: {invalid!r}",
+                )
+
+            for backend in ("original", "sglang"):
+                data["correctness"][backend].pop("graph_replay")
+            result_path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(REPORT.load_case(case_dir)[1], "failed")
+
     def test_missing_and_failed_cases_are_distinct_and_not_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

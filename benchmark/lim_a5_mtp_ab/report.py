@@ -64,6 +64,13 @@ def _fixture_identity(payload: dict[str, Any]) -> tuple[Any, ...] | None:
     return values if all(value for value in values) else None
 
 
+def _graph_replay_passed(value: Any) -> bool:
+    """Accept the runner's validation detail or the legacy boolean schema."""
+    if value is True:
+        return True
+    return isinstance(value, dict) and value.get("passed") is True
+
+
 def load_case(case_dir: Path) -> tuple[dict[str, Any] | None, str]:
     """Load one runner result and validate its basic schema/status."""
     status_path = case_dir / "status"
@@ -94,7 +101,7 @@ def load_case(case_dir: Path) -> tuple[dict[str, Any] | None, str]:
     ):
         return payload, "failed"
     if _case_dict(payload).get("mode") == "graph" and any(
-        correctness[backend].get("graph_replay") is not True
+        not _graph_replay_passed(correctness[backend].get("graph_replay"))
         for backend in ("original", "sglang")
     ):
         return payload, "failed"

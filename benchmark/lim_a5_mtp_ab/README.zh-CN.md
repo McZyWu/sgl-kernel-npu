@@ -291,6 +291,24 @@ python3 benchmark/lim_a5_mtp_ab/report.py \
   --output-root /work/a5-lim-results-001 --regression-threshold-pct 5
 ```
 
+报告读取已有结果，所以这里使用原来的结果目录；无需新建结果目录或重新运行矩阵。
+早期报告程序将Graph回放校验只按布尔值`true`读取，而runner实际保存带`passed`
+字段的完整校验对象，可能把已成功执行的Graph误标为failed。报告已兼容完整对象和
+历史布尔格式，仍要求明确通过、进程退出0、正式轮次/样本及其他正确性条件全部满足。
+更新报告脚本后重生成即可重新判定；原始case JSON、退出码与样本不修改。
+
+缺少matplotlib只影响绘图。可以使用独立的CPU报告环境，不替换NPU测试环境的包：
+
+```bash
+python3 -m venv /work/a5-report-env-001
+/work/a5-report-env-001/bin/python -m pip install matplotlib
+/work/a5-report-env-001/bin/python benchmark/lim_a5_mtp_ab/report.py \
+  --output-root /work/a5-lim-results-002 --regression-threshold-pct 5
+```
+
+报告环境目录也应选一个尚不存在的路径；报告输出目录则指向已经完成测试的目录。
+报告脚本只读取已有JSON/样本并绘图，不加载torch、不初始化NPU。
+
 计时为Eager NPU event或Graph replay经过时间。前置动态量化、metadata生成、池恢复、
 正确性检查不在区间内；LI返回输出、LIM写caller-owned输出，这是接口差异。
 event时间也可能包含主机提交间隙，不能直接称为纯kernel活跃时间。
