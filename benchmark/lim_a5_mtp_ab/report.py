@@ -434,8 +434,12 @@ def build_report(output_root: Path, threshold_pct: float = 5.0) -> dict[str, Any
             detail = (
                 f"每请求目标miss={round(q * 2048 * (1 - hit / 100))}，"
                 f"实测union miss={request_misses}；"
-                f"union hit={_fmt(fixture_stats.get('selected_prefix_hit_rate'))}，"
-                f"route occurrence hit={_fmt(fixture_stats.get('route_occurrence_hit_rate'))}。"
+                "目标标签hit="
+                f"{_fmt(fixture_stats.get('selected_prefix_union_target_hit_rate'))}，"
+                "唯一选中prefix并集hit="
+                f"{_fmt(fixture_stats.get('unique_selected_prefix_hit_rate'))}，"
+                "逐route访问hit="
+                f"{_fmt(fixture_stats.get('route_occurrence_hit_rate'))}。"
             )
         config_lines.append(
             f"- `{case_id}`：Q{q}，{case_id.split('_')[1]}，{policy} filler，"
@@ -528,17 +532,22 @@ hit 目标按 selected prefix union 口径：Q1 的 91%/95% 对应 184/102 个 m
 ## 调用链
 
 ```mermaid
-flowchart LR
-  A[冻结量化输入与哈希] --> B[A5 官方 LI TopK/reference]
-  B --> C[fixture 构造: Q1/Q4, 91/95 union misses, filler]
-  C --> D[LI backend]
-  C --> E[vLLM 原版 LIM]
-  C --> F[SGLang LIM]
-  D --> G[eager/graph 分轮原始 samples]
+flowchart TD
+  A[冻结量化输入与哈希]
+  A --> B[计时外: 官方 LI 参考 TopK]
+  B --> C[计时外: 固定 miss 集合与 low/random 缓存快照]
+  C --> R[每次调用前恢复各自缓存池, 计时外]
+  A --> D[正式计时: 官方 LI, 不读 resident 缓存池]
+  A --> E[正式计时: PR 原版 LIM, 自行计算 TopK 与缓存管理]
+  A --> F[正式计时: SGLang LIM, 自行计算 TopK 与缓存管理]
+  R --> E
+  R --> F
+  D --> G[Eager 调用或 Graph 回放的分轮原始样本]
   E --> G
   F --> G
-  G --> H[正确性与哈希门禁]
-  H --> I[CSV/JSON/中文报告/散点与均值趋势]
+  B -. 参考校验 .-> H
+  G --> H[计时外: 正确性, 状态与哈希检查]
+  H --> I[合格结果生成 CSV/JSON/中文报告/图]
 ```
 """
     (output_root / "REPORT.md").write_text(report, encoding="utf-8")

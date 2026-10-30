@@ -14,6 +14,11 @@ SPEC = importlib.util.spec_from_file_location("a5_mtp_ab_report", REPORT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 REPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(REPORT)
+FIXTURE_PATH = ROOT / "benchmark" / "lim_a5_mtp_ab" / "fixture.py"
+FIXTURE_SPEC = importlib.util.spec_from_file_location("a5_mtp_ab_fixture", FIXTURE_PATH)
+assert FIXTURE_SPEC is not None and FIXTURE_SPEC.loader is not None
+FIXTURE = importlib.util.module_from_spec(FIXTURE_SPEC)
+FIXTURE_SPEC.loader.exec_module(FIXTURE)
 
 
 def payload(case_id: str, *, diagnostic_only: bool = False) -> dict:
@@ -77,6 +82,49 @@ def payload(case_id: str, *, diagnostic_only: bool = False) -> dict:
 
 
 class ReportTests(unittest.TestCase):
+    def test_config_displays_all_fixture_hit_rate_definitions(self) -> None:
+        reference = [
+            [[0, 1, 2, 3]] * 4,
+            [[0, 1, 4, 5]] * 4,
+        ]
+        residency = FIXTURE.build_residency(
+            reference=reference,
+            prefix_tokens=16,
+            capacity=8,
+            misses=1,
+            policy="low",
+            seed=7,
+        )
+        data = payload("q4_eager_low_hit91")
+        data["fixture"]["stats"] = residency["stats"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "q4_eager_low_hit91"
+            (case_dir / "runner").mkdir(parents=True)
+            (case_dir / "status").write_text("0\n", encoding="utf-8")
+            (case_dir / "runner" / "case.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+            result = REPORT.build_report(Path(directory))
+            report = Path(result["report"]).read_text(encoding="utf-8")
+
+        stats = residency["stats"]
+        self.assertIn(
+            f"目标标签hit={stats['selected_prefix_union_target_hit_rate']:.3f}",
+            report,
+        )
+        self.assertIn(
+            f"唯一选中prefix并集hit={stats['unique_selected_prefix_hit_rate']:.3f}",
+            report,
+        )
+        self.assertIn(
+            f"逐route访问hit={stats['route_occurrence_hit_rate']:.3f}", report
+        )
+        self.assertNotEqual(
+            stats["selected_prefix_union_target_hit_rate"],
+            stats["unique_selected_prefix_hit_rate"],
+        )
+
     def test_runner_graph_replay_details_are_measured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             case_dir = Path(directory) / "q1_graph_low_hit91"
