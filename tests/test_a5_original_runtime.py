@@ -26,6 +26,11 @@ STAGE_SPEC = importlib.util.spec_from_file_location(
 )
 STAGE = importlib.util.module_from_spec(STAGE_SPEC)
 STAGE_SPEC.loader.exec_module(STAGE)
+RECORD_SPEC = importlib.util.spec_from_file_location(
+    "_record_original_under_test", STAGE_PATH.with_name("record_install.py")
+)
+RECORD = importlib.util.module_from_spec(RECORD_SPEC)
+RECORD_SPEC.loader.exec_module(RECORD)
 
 VENDOR = "vendors/sglc8original_transformer"
 REVISIONS = {
@@ -273,6 +278,48 @@ class OriginalOppRuntimeTests(unittest.TestCase):
             )
             STAGE.clear(relocated)
             self.assertIsNone(ORIGINAL_OPP.activate(relocated))
+
+    def test_cann_internal_tiling_link_is_recorded_and_survives_relocation(self):
+        """CANN installs liboptiling.so as an internal relative symlink."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build = base / "build"
+            self._make_build(build)
+            tiling = build / "opp" / VENDOR / "op_impl/ai_core/tbe/op_tiling"
+            actual = tiling / "lib/linux/aarch64/libcust_opmaster_rt2.0.so"
+            actual.parent.mkdir(parents=True)
+            actual.write_bytes(b"CPU-only tiling library marker")
+            link = tiling / "liboptiling.so"
+            link.symlink_to(Path("lib") / "linux/aarch64/libcust_opmaster_rt2.0.so")
+            receipt = RECORD.record(build)
+            self.assertEqual(receipt["internal_symlinks"], 1)
+            package = base / "package"
+            STAGE.stage(build, package)
+            relocated = base / "relocated"
+            package.rename(relocated)
+            copied = (
+                relocated
+                / "lib/a5_original_opp"
+                / VENDOR
+                / link.relative_to(build / "opp" / VENDOR)
+            )
+            self.assertFalse(copied.is_symlink())
+            self.assertTrue(link.is_symlink())
+            manifest = ORIGINAL_OPP.activate(relocated)
+            self.assertTrue(manifest["source_symlinks"])
+            ORIGINAL_OPP.verify_library(relocated, manifest, str(copied))
+
+    def test_record_install_rejects_link_outside_its_vendor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build = base / "build"
+            self._make_build(build)
+            outside = base / "outside.so"
+            outside.write_bytes(b"outside")
+            link = build / "opp" / VENDOR / "outside.so"
+            link.symlink_to(os.path.relpath(outside, link.parent))
+            with self.assertRaisesRegex(ValueError, "relocatable vendor"):
+                RECORD.record(build)
 
     def test_reusing_changed_source_or_install_is_rejected_before_replacing_package(
         self,

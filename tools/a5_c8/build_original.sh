@@ -45,20 +45,5 @@ shopt -u nullglob
 [[ ${#installers[@]} -eq 1 ]] || { echo "Expected one original OPP installer" >&2; exit 1; }
 mkdir -- "$output/opp"
 bash "${installers[0]}" -- "--install-path=$output/opp"
-python3 - "$output" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-opp = root / "opp"
-files = {}
-for path in sorted(opp.rglob("*")):
-    if path.is_file():
-        if path.is_symlink():
-            raise RuntimeError(f"Unexpected symlink in original OPP: {path}")
-        files[path.relative_to(opp).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-(root / "installed_files.sha256.json").write_text(json.dumps(files, indent=2) + "\n")
-PY
+python3 "$script_dir/record_install.py" --build-root "$output"
 echo "Original C8 OPP built and privately installed: $output"

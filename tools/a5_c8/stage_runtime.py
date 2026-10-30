@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -45,6 +46,23 @@ def stage(build_root: Path, package_root: Path) -> Path:
         raise ValueError("original OPP installation has no ACLNN shared library")
     receipt = build_root / "installed_files.sha256.json"
     installed_hashes = json.loads(receipt.read_text(encoding="utf-8"))
+    link_receipt = build_root / "installed_symlinks.json"
+    installed_links = (
+        json.loads(link_receipt.read_text(encoding="utf-8"))
+        if link_receipt.is_file()
+        else {}
+    )
+    for path in installed.rglob("*"):
+        if path.is_symlink():
+            relative = path.relative_to(build_root / "opp").as_posix()
+            if (
+                installed_links.get(relative) != os.readlink(path)
+                or os.path.isabs(os.readlink(path))
+                or not path.resolve(strict=True).is_relative_to(installed.resolve())
+            ):
+                raise ValueError(
+                    f"unrecorded or non-relocatable original OPP link: {relative}"
+                )
     for relative, expected in installed_hashes.items():
         path = (build_root / "opp" / relative).resolve(strict=True)
         if not path.is_relative_to((build_root / "opp").resolve()):
@@ -61,7 +79,9 @@ def stage(build_root: Path, package_root: Path) -> Path:
     if destination.exists():
         shutil.rmtree(destination)
     target = destination / VENDOR
-    shutil.copytree(installed, target)
+    # Wheel archives do not preserve filesystem symlinks reliably. Materialize
+    # each validated internal target without changing its bytes or visible path.
+    shutil.copytree(installed, target, symlinks=False)
     shutil.copyfile(source_manifest, destination / "SOURCE_MANIFEST.json")
     files = {
         path.relative_to(destination).as_posix(): digest(path)
@@ -75,6 +95,7 @@ def stage(build_root: Path, package_root: Path) -> Path:
         "operators": metadata["operators"],
         "operator_backends": {"lim": "original_aclnn", "copy_sfa": "direct"},
         "files": files,
+        "source_symlinks": installed_links,
         "source_manifest_sha256": digest(source_manifest),
         "execution_configuration": {
             "SIMT_POSTPROCESS": 1,

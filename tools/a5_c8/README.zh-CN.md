@@ -6,7 +6,7 @@
 | 恢复原版 LIM 执行方式 | ✅ 代码已接入 | 正常 `npu::fused_quant_lightning_indexer_manage` 接口调用固定 PR18383 的 ACLNN/OPP；原始源码、SIMT、UB和host tiling不修改 |
 | 普通 wheel 包含私有 OPP | ✅ 构建入口已接入 | Ascend950 默认构建原LIM OPP，随wheel安装并优先使用；不装vLLM Python框架 |
 | 保留 Copy-SFA 原生计算 | ✅ | 继续使用已迁入的原版device payload和SGLang注册DRAM地址适配；此项仍为direct启动 |
-| CPU逻辑、激活、真实build_py打包检查 | ✅ 43项通过 | marker产物只用于打包测试，不加载NPU库；不代表A5设备通过 |
+| CPU逻辑、激活、真实build_py打包检查 | ✅ | marker产物只用于打包测试，不加载NPU库；具体数量以验证回执为准 |
 | 217交叉编译与C++检查 | ⏳ | 以实际构建回执为准；不代表A5设备通过 |
 | A5精度、Graph及性能对齐 | ⏳ | 用户在A5容器执行，不能用217/A3交叉编译替代 |
 
@@ -58,6 +58,8 @@ python3 -m pip install --force-reinstall --no-deps output/sgl_kernel_npu-*.whl
 
 最终wheel内包括 `sgl_kernel_npu/lib/a5_original_opp/`。导入包时先校验哈希、设置自有 `ASCEND_CUSTOM_OPP_PATH`，再导入torch_npu和加载算子；实际解析到的ACLNN库必须来自这份wheel中的私有vendor，否则明确报错，不回退旧vector路径。
 
+CANN安装器的内部相对软链接（如`liboptiling.so`）记录在来源清单中。wheel打包时将其指向的同字节内容实体化，保留可见路径，避免wheel安装丢失链接；原始OPP安装目录和算子代码不修改。
+
 整网启动前可在当前shell提前激活，使OPP在第一次设备初始化之前已经可见。该脚本只读安装包元数据和哈希，不导入torch或初始化设备：
 
 ```bash
@@ -74,6 +76,14 @@ bash build.sh -a kernels Ascend950
 ```
 
 复用时重新校验固定来源、源文件和安装文件哈希。显式 `SGL_KERNEL_A5_C8_BACKEND=direct` 才构建历史direct LIM；它仅供保留对照，默认值为original。A3没有原OPP依赖。
+
+如果旧版已成功安装OPP，却在生成清单时以 `Unexpected symlink ... liboptiling.so` 结束，可更新到包含内部链接支持的版本后重建清单并复用产物，不用重编原OPP。旧失败日志和退出码保留：
+
+```bash
+ORIGINAL_BUILD=/absolute/path/to/output/a5-c8-original-实际时间-PID
+python3 tools/a5_c8/record_install.py --build-root "$ORIGINAL_BUILD" &&
+SGL_KERNEL_A5_C8_PREBUILT="$ORIGINAL_BUILD" bash build.sh -a kernels Ascend950
+```
 
 ## 先确认实际加载路径
 
