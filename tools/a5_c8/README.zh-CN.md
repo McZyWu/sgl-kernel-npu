@@ -6,8 +6,8 @@
 | 恢复原版 LIM 执行方式 | ✅ 代码已接入 | 正常 `npu::fused_quant_lightning_indexer_manage` 接口调用固定 PR18383 的 ACLNN/OPP；原始源码、SIMT、UB和host tiling不修改 |
 | 普通 wheel 包含私有 OPP | ✅ 构建入口已接入 | Ascend950 默认构建原LIM OPP，随wheel安装并优先使用；不装vLLM Python框架 |
 | 保留 Copy-SFA 原生计算 | ✅ | 继续使用已迁入的原版device payload和SGLang注册DRAM地址适配；此项仍为direct启动 |
-| CPU逻辑、激活、真实build_py打包检查 | ✅ | marker产物只用于打包测试，不加载NPU库；具体数量以验证回执为准 |
-| 217交叉编译与C++检查 | ⏳ | 以实际构建回执为准；不代表A5设备通过 |
+| CPU逻辑、激活、真实build_py打包检查 | ✅ 45项通过 | marker产物只用于打包测试，不加载NPU库；不代表A5设备通过 |
+| 217原OPP交叉编译与新桥C++语法检查 | ✅ | 原OPP编译安装完成；内部链接清单修复后，复用产物恢复/打包/搬迁激活退出均0；未重跑空目录完整构建 |
 | A5精度、Graph及性能对齐 | ⏳ | 用户在A5容器执行，不能用217/A3交叉编译替代 |
 
 ## 为什么可以使用原版
@@ -111,3 +111,5 @@ PY
 4. 整网长短请求smoke、确认长输入进入真实miss路径，再跑GSM8K和整网吞吐/TPOT。旧短请求GSM8K通过不能替代真实miss覆盖。
 
 这份README不声明新的A5数值或性能收益。所有A5运行结果以用户返回的原始日志和JSON为准。
+
+2026-10-30验证边界：217上只进行了CPU交叉编译、四个新桥/注册相关C++翻译单元语法检查、隔离OPP打包与搬迁激活；没有运行NPU请求，也没有在该轮生成完整普通kernel wheel。首版包装脚本在CANN合法内部链接处退出1的日志保留；更新后的记录/stage/激活分别退出0，原installer哈希保持。目标A5仍需重新构建安装kernel wheel并完成数值与性能验收。
