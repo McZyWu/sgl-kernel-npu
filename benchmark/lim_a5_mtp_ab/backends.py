@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -29,6 +30,24 @@ def loaded_libraries():
         if p.startswith("/") and ".so" in p and Path(p).is_file():
             paths.add(os.path.realpath(p))
     return [{"path": p, "sha256": file_sha(p)} for p in sorted(paths)]
+
+
+@contextmanager
+def original_library_scope(opp_root):
+    """Let the isolated adapter capture its own OPP paths when its DSO loads."""
+    before = os.environ.get("ASCEND_CUSTOM_OPP_PATH")
+    if opp_root:
+        selected = str(Path(opp_root).resolve(strict=True))
+        current = (before or "").split(os.pathsep)
+        paths = list(dict.fromkeys([selected] + [p for p in current if p]))
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(paths)
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("ASCEND_CUSTOM_OPP_PATH", None)
+        else:
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = before
 
 
 def load_backends(args):
@@ -57,8 +76,15 @@ def load_backends(args):
     }
     if str(sgl_library) not in registered_libraries:
         raise RuntimeError(f"SGLang library was not registered by torch: {sgl_library}")
-    if args.original_library:
-        torch.ops.load_library(str(Path(args.original_library).resolve(strict=True)))
+    with original_library_scope(
+        args.original_opp_root or os.environ.get("ORIGINAL_OPP_ROOT")
+    ):
+        if args.original_library:
+            torch.ops.load_library(
+                str(Path(args.original_library).resolve(strict=True))
+            )
+        if args.original_module:
+            importlib.import_module(args.original_module)
     binding_manifest = None
     if os.environ.get("ORIGINAL_BINDING_MANIFEST"):
         manifest_path = Path(os.environ["ORIGINAL_BINDING_MANIFEST"]).resolve(
@@ -76,8 +102,6 @@ def load_backends(args):
             "sha256": file_sha(manifest_path),
             "contents": binding_manifest,
         }
-    if args.original_module:
-        importlib.import_module(args.original_module)
     namespace, sep, name = args.original_op.partition(".")
     if not sep or not namespace or not name:
         raise ValueError("--original-op must be namespace.operator")

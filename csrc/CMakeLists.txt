@@ -390,13 +390,45 @@ ascendc_compile_options(sparse_flash_attention_kernel PRIVATE
     "SHELL:-mllvm -cce-aicore-hoist-movemask=false"
 )
 
-# C8 offload kernels are A5-only. The vendor payloads retain their provenance.
+# A5 LIM uses the original ACLNN/OPP by default. The direct backend is explicit.
+set(SGL_KERNEL_A5_C8_BACKEND "original" CACHE STRING "A5 C8 backend: original or direct")
+set_property(CACHE SGL_KERNEL_A5_C8_BACKEND PROPERTY STRINGS original direct)
+if(NOT SGL_KERNEL_A5_C8_BACKEND STREQUAL "original" AND NOT SGL_KERNEL_A5_C8_BACKEND STREQUAL "direct")
+    message(FATAL_ERROR "SGL_KERNEL_A5_C8_BACKEND must be original or direct")
+endif()
+set(SGL_KERNEL_A5_C8_ORIGINAL_SOURCE "" CACHE PATH "Prepared original vllm-ascend source root")
 if(SGL_KERNEL_ENABLE_A5_ONLY_OPS)
-    list(APPEND OP_SRCS
-        ${PROJECT_OP_SRC_BASE}/a5_c8_registration.cpp
-        ${PROJECT_OP_SRC_BASE}/fused_quant_lightning_indexer_manage/op_host/fused_quant_lightning_indexer_manage.cpp
+    list(APPEND OP_SRCS ${PROJECT_OP_SRC_BASE}/a5_c8_registration.cpp
         ${PROJECT_OP_SRC_BASE}/fused_quant_scatter_copy_sparse_flash_attention/op_host/fused_quant_copy_sfa.cpp)
-    foreach(op fused_quant_lightning_indexer_manage fused_quant_scatter_copy_sparse_flash_attention)
+    set(_a5_c8_direct_ops fused_quant_scatter_copy_sparse_flash_attention)
+    if(SGL_KERNEL_A5_C8_BACKEND STREQUAL "original")
+        set(_a5_original_csrc "${SGL_KERNEL_A5_C8_ORIGINAL_SOURCE}/csrc")
+        foreach(_source
+            attention/fused_quant_lightning_indexer_manage/fused_quant_lightning_indexer_manage_torch_adpt.h
+            attention/fused_quant_lightning_indexer_manage/fused_quant_lightning_indexer_manage_ordered.h
+            aclnn_torch_adapter/op_api_common.h
+            aclnn_torch_adapter/NPUBridge.cpp
+            aclnn_torch_adapter/NPUStorageImpl.cpp)
+            if(NOT EXISTS "${_a5_original_csrc}/${_source}")
+                message(FATAL_ERROR "Missing original A5 source: ${_a5_original_csrc}/${_source}")
+            endif()
+        endforeach()
+        add_compile_definitions(SGL_KERNEL_A5_C8_ORIGINAL)
+        list(APPEND OP_SRCS ${PROJECT_OP_SRC_BASE}/a5_c8_original.cpp
+            ${_a5_original_csrc}/aclnn_torch_adapter/NPUBridge.cpp
+            ${_a5_original_csrc}/aclnn_torch_adapter/NPUStorageImpl.cpp)
+        set_source_files_properties(${PROJECT_OP_SRC_BASE}/a5_c8_original.cpp
+            ${_a5_original_csrc}/aclnn_torch_adapter/NPUBridge.cpp
+            ${_a5_original_csrc}/aclnn_torch_adapter/NPUStorageImpl.cpp
+            PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden"
+            COMPILE_DEFINITIONS "vllm_ascend=sgl_a5_original")
+        message(STATUS "A5 C8: original LIM ACLNN; CopySFA direct (registered host memory ABI)")
+    else()
+        list(APPEND OP_SRCS ${PROJECT_OP_SRC_BASE}/fused_quant_lightning_indexer_manage/op_host/fused_quant_lightning_indexer_manage.cpp)
+        list(APPEND _a5_c8_direct_ops fused_quant_lightning_indexer_manage)
+        message(STATUS "A5 C8: direct LIM and CopySFA")
+    endif()
+    foreach(op IN LISTS _a5_c8_direct_ops)
         ascendc_library(${op}_a5_kernel STATIC ${PROJECT_OP_SRC_BASE}/${op}/op_kernel/${op}.cpp)
         ascendc_include_directories(${op}_a5_kernel PRIVATE
             ${PROJECT_OP_SRC_BASE}/${op}/op_kernel
@@ -408,12 +440,12 @@ if(SGL_KERNEL_ENABLE_A5_ONLY_OPS)
             "SHELL:-mllvm -cce-aicore-hoist-movemask=false")
         list(APPEND A5_C8_KERNEL_TARGETS ${op}_a5_kernel)
     endforeach()
-    # Direct launch has no OPP SetLocalMemorySize(216KiB) launch attribute.
-    # Use the vendor vector postprocess until that SIMT UB reservation is available.
-    ascendc_compile_definitions(fused_quant_lightning_indexer_manage_a5_kernel PRIVATE
-        -DLIM_SIMT_POSTPROCESS=0 -DLIM_SIMT_VICTIM_UNPACK=0)
+    if(SGL_KERNEL_A5_C8_BACKEND STREQUAL "direct")
+        # Direct launch lacks the OPP local-memory reservation for SIMT.
+        ascendc_compile_definitions(fused_quant_lightning_indexer_manage_a5_kernel PRIVATE
+            -DLIM_SIMT_POSTPROCESS=0 -DLIM_SIMT_VICTIM_UNPACK=0)
+    endif()
 endif()
-
 # create shared library
 add_library(${OP_PLUGIN_NAME} SHARED ${OP_SRCS})
 
@@ -444,6 +476,7 @@ target_compile_options(${OP_PLUGIN_NAME} PRIVATE -fopenmp)
 target_link_libraries(${OP_PLUGIN_NAME} PRIVATE gomp)
 
 target_include_directories(${OP_PLUGIN_NAME} PRIVATE
+        ${_a5_original_csrc}
         ${PROJECT_OP_SRC_BASE}/utils
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_OP_SRC_BASE}/causal_conv1d_update/op_kernel

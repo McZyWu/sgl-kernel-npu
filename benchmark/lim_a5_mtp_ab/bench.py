@@ -352,11 +352,29 @@ def run(args, case, out):
     source = source_provenance(repo)
     versions["original_compile_variant"] = args.original_variant
     versions["original_source_revision_hint"] = args.original_source_revision
-    versions["sglang_compile_variant"] = (
-        "CMake forces SIMT postprocess/victim=0; verify actual built library"
+    backend = (
+        torch.ops.npu.a5_c8_backend()
+        if hasattr(torch.ops.npu, "a5_c8_backend")
+        else "legacy_direct"
     )
+    versions["sglang_compile_variant"] = (
+        "original ACLNN/OPP LIM; pinned SIMT defaults, verify source/build manifest"
+        if backend == "original"
+        else "direct LIM; SIMT postprocess/victim=0, verify actual built library"
+    )
+    versions["sglang_backend"] = backend
+    versions["sglang_original_runtime_manifest"] = getattr(
+        sys.modules.get("sgl_kernel_npu"), "_original_opp_manifest", None
+    )
+    if backend == "original":
+        versions["sglang_resolved_original_libraries"] = dict(
+            torch.ops.npu.resolve_a5_c8_original_libraries()
+        )
     versions["variant_note"] = (
-        "Original SIMT variant may differ; no causal attribution without matching builds."
+        "Both LIM entries use the pinned original implementation; inspect manifests and resolved libraries. "
+        "Multiple OPP vendors may share device-op routing in one process."
+        if backend == "original"
+        else "Original SIMT variant may differ; no causal attribution without matching builds."
     )
     versions["environment"] = {
         k: os.environ.get(k)

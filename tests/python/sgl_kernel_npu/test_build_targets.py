@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import shlex
+import shutil
 import subprocess
 import sys
 from configparser import ConfigParser
@@ -241,3 +243,97 @@ def test_wheel_packages_only_sgl_kernel_npu(wheel_setup):
     """
     packages = wheel_setup.setup_kwargs["packages"]
     assert {name.split(".")[0] for name in packages} == {"sgl_kernel_npu"}
+
+
+def test_build_py_includes_deep_original_opp_runtime_files(
+    wheel_setup, monkeypatch, tmp_path
+):
+    """Dynamic package_data enumeration must stage the real nested OPP tree.
+
+    Build from a temporary copy so marker files never enter the source tree.
+    The fake .so is only package data; this test does not load it or use an NPU.
+    """
+    project = tmp_path / "project"
+    package_root = project / "sgl_kernel_npu"
+    (package_root / "lib" / "a5_original_opp").mkdir(parents=True)
+    (project / "build_tools").mkdir()
+    (project / "target_providers" / "Ascend910" / "norm").mkdir(parents=True)
+    shutil.copy2(SETUP_PATH, project / "setup.py")
+    shutil.copy2(
+        PACKAGE_ROOT / "build_tools" / "target_provider.py",
+        project / "build_tools" / "target_provider.py",
+    )
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "config.ini").write_text(
+        "[global]\nversion = 0.0.0\n", encoding="utf-8"
+    )
+    (
+        project / "target_providers" / "Ascend910" / "norm" / "gemma_rmsnorm.py"
+    ).write_text("# CPU packaging fixture\n", encoding="utf-8")
+
+    opp_root = package_root / "lib" / "a5_original_opp"
+    vendor = opp_root / "vendors" / "sglc8original_transformer"
+    aclnn = vendor / "op_api" / "lib" / "libcust_opapi.so"
+    aclnn.parent.mkdir(parents=True)
+    aclnn.write_bytes(b"CPU-only package marker, not a loadable library")
+    op_json = (
+        vendor / "op_impl" / "ai_core" / "tbe" / "config" / "ascend910b" / "lim.json"
+    )
+    op_json.parent.mkdir(parents=True)
+    op_json.write_text('{"operator": "lim"}\n', encoding="utf-8")
+    manifest = opp_root / "runtime_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "backend": "original",
+                "vendor": "vendors/sglc8original_transformer",
+                "operators": {
+                    "lim": {
+                        "backend": "original_aclnn",
+                        "revision": "7d5a4cd9d7e8c4e2e4f0f6415a71f0e80edcff8e",
+                    },
+                    "copy_sfa": {
+                        "backend": "direct",
+                        "revision": "1b180deb840484c2fe33cbdd7abb68a615085172",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Re-execute the actual setup.py in the temporary project. NpuExtension is
+    # the only build dependency mocked by the shared wheel_setup fixture.
+    setup_kwargs = {}
+    monkeypatch.setattr(
+        setuptools, "setup", lambda **kwargs: setup_kwargs.update(kwargs)
+    )
+    monkeypatch.syspath_prepend(str(project))
+    monkeypatch.chdir(project)
+    spec = importlib.util.spec_from_file_location(
+        "sgl_kernel_npu_temp_setup", project / "setup.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv(module.BUILD_TARGET_ENV, "Ascend910")
+
+    build_lib = tmp_path / "build-lib"
+    distribution = Distribution(setup_kwargs)
+    distribution.script_name = str(project / "setup.py")
+    command = module.TargetBuildPy(distribution)
+    command.ensure_finalized()
+    command.build_lib = str(build_lib)
+    command.run()
+
+    staged_root = build_lib / "sgl_kernel_npu" / "lib" / "a5_original_opp"
+    assert (staged_root / "runtime_manifest.json").read_bytes() == manifest.read_bytes()
+    assert (
+        staged_root / "vendors/sglc8original_transformer/op_api/lib/libcust_opapi.so"
+    ).read_bytes() == aclnn.read_bytes()
+    assert (
+        staged_root
+        / "vendors/sglc8original_transformer/op_impl/ai_core/tbe/config/ascend910b/lim.json"
+    ).read_bytes() == op_json.read_bytes()
+    staged_manifest = json.loads((staged_root / "runtime_manifest.json").read_text())
+    assert staged_manifest["operators"]["lim"]["backend"] == "original_aclnn"
+    assert staged_manifest["operators"]["copy_sfa"]["backend"] == "direct"

@@ -74,12 +74,14 @@ TND/PA_BSND、quant mode0、sparse mode3。不能用A3 BF16 LI充当A5参考。
   这个差别属于安装包生成工具，来源、SHA与限制见`vendor/README.md`和准备manifest。
 - 旧提交保留标记：`lim-a5-before-mtp-manual-20261029`；新内容以追加commit交付。
 
-**现有迁移版CMake明确编译vector后处理**：`LIM_SIMT_POSTPROCESS=0`、
-`LIM_SIMT_VICTIM_UNPACK=0`。原版默认可能是SIMT，需要额外的UB启动预留。
-本次不更改这些默认值，避免影响非MTP路径。随包构建会记录原版源码、构建命令和
-OPP来源，并设置`ORIGINAL_VARIANT`；若自行接入其他原版库，不知道其配置时保留
-`unknown`。这组配置未对齐时，测到的是部署版本
-的对照，不能仅凭差值归因于迁移算法本身。
+历史direct迁移版的CMake强制vector后处理：`LIM_SIMT_POSTPROCESS=0`、
+`LIM_SIMT_VICTIM_UNPACK=0`。当前新分支默认经SGLang正常接口调用固定原版LIM OPP，
+保留其SIMT与UB启动配置；构建说明见 `../../tools/a5_c8/README.zh-CN.md`。
+使用 `SGL_KERNEL_A5_C8_BACKEND=direct` 显式保留旧direct对照。随包构建记录原版源码、
+构建命令、OPP来源和`ORIGINAL_VARIANT`；自行接入其他原版库且不知道配置时保留
+`unknown`。runner记录实际sglang backend、runtime manifest及DSO路径。
+配置未对齐时不能将差额全部归因于迁移算法；同进程两个OPP vendor可能共享device-op
+路由，host DSO路径本身不证明独立device binary执行。
 
 ## 在A5容器准备
 

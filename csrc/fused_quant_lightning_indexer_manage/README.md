@@ -9,7 +9,11 @@ and attribution are retained; the CANN and Apache license texts are also present
 under `../fused_lightning_indexer_manage/licenses/`.
 
 This is an A5-only operator. The existing non-quantized A2/A3 LIM entry is separate.
-Build with `bash build.sh -a kernels Ascend950` from the repository root.
+Build with `bash build.sh -a kernels Ascend950` from the repository root. The
+default build packages the pinned original ACLNN/OPP and uses a thin production
+bridge, retaining its original SIMT, host tiling and UB launch configuration.
+See `../../tools/a5_c8/README.zh-CN.md` for building and inspecting the active
+backend. This does not install the vLLM Python framework.
 
 The 19 Tensor arguments follow the donor interface: BF16 index weights,
 FP32 query scales, FP8 E4M3FN query `[T,32|64,128]`, FP32 index-key scales,
@@ -39,10 +43,12 @@ strides. It retains Tensor/workspace owners across ordered torch_npu submission.
 The device entry loads GM tiling fields explicitly, provides the missing event
 constant, and excludes A5 payloads from the host-only parsing pass.
 
-The normal direct-launch build uses the donor's vector management path
+The explicitly selected `SGL_KERNEL_A5_C8_BACKEND=direct` build uses the donor's vector management path
 (`LIM_SIMT_POSTPROCESS=0`, `LIM_SIMT_VICTIM_UNPACK=0`). The donor's SIMT sources
 remain available, but enabling them also requires its 216 KiB user-UB launch
-reservation. No SIMT performance parity is claimed by this port.
+reservation. The default original backend delegates that reservation and launch
+to the unchanged original OPP. Target A5 numerical and performance validation is
+still required; retaining the source and configuration does not establish parity.
 
 Run the donor's A5 contract/oracle tests with:
 

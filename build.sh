@@ -492,6 +492,31 @@ function build_cmake_modules()
         "-DBUILD_CATLASS_MODULE=${BUILD_CATLASS_MODULE:-OFF}"
     )
 
+    if [[ "$BUILD_KERNELS_MODULE" == "ON" && "$SGL_KERNEL_NPU_BUILD_TARGET" == "Ascend950" ]]; then
+        local backend="${SGL_KERNEL_A5_C8_BACKEND:-original}"
+        cmake_args+=("-DSGL_KERNEL_A5_C8_BACKEND=$backend")
+        if [[ "$backend" == "original" ]]; then
+            local original_build="${SGL_KERNEL_A5_C8_PREBUILT:-}"
+            if [[ -z "$original_build" ]]; then
+                original_build="$OUTPUT_DIR/a5-c8-original-$(date +%Y%m%d-%H%M%S)-$$"
+                bash "$PROJECT_ROOT/tools/a5_c8/build_original.sh" "$original_build"
+            fi
+            original_build=$(cd -- "$original_build" && pwd -P)
+            python3 "$PROJECT_ROOT/tools/a5_c8/stage_runtime.py" \
+                --build-root "$original_build" \
+                --package-root "$PROJECT_ROOT/python/sgl_kernel_npu/sgl_kernel_npu"
+            cmake_args+=("-DSGL_KERNEL_A5_C8_ORIGINAL_SOURCE=$original_build/prepared/source")
+        elif [[ "$backend" != "direct" ]]; then
+            die "SGL_KERNEL_A5_C8_BACKEND must be original or direct"
+        else
+            python3 "$PROJECT_ROOT/tools/a5_c8/stage_runtime.py" --clear \
+                --package-root "$PROJECT_ROOT/python/sgl_kernel_npu/sgl_kernel_npu"
+        fi
+    elif [[ "$BUILD_KERNELS_MODULE" == "ON" ]]; then
+        python3 "$PROJECT_ROOT/tools/a5_c8/stage_runtime.py" --clear \
+            --package-root "$PROJECT_ROOT/python/sgl_kernel_npu/sgl_kernel_npu"
+    fi
+
     if [[ -n "$ASC_CMAKE_DIR" ]]; then
         cmake_args+=(
             "-DCMAKE_PREFIX_PATH=$ASC_CMAKE_DIR"

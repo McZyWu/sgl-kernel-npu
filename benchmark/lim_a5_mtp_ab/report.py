@@ -498,11 +498,11 @@ Q/K为FP8 E4M3FN、weights为BF16、dequant scale为FP32、稳态request_state=-
 
 {configs}
 
-hit 目标按 selected prefix union 口径：Q1 的 91%/95% 对应 184/102 个 miss；Q4 对应 737/410 个 miss。逐 route occurrence 命中率、唯一 union miss 数及 tail slot 规则以 case fixture manifest 为准。低 ID/random 只改变非选中 filler；不同 Q、执行模式、filler 与 hit 目标是独立矩阵因素。
+命中标签定义为 `1 - unique_prefix_union_misses / (Q*2048)`：Q1 的 91%/95% 对应 184/102 个 miss；Q4 对应 737/410 个 miss。它不等于以实际唯一 selected-prefix union 为分母的命中率。逐 route occurrence 命中率、唯一 union miss 数及 tail slot 规则以 case fixture manifest 为准。低 ID/random 只改变非选中 filler；不同 Q、执行模式、filler 与 hit 目标是独立矩阵因素。
 
 共享工作负载：B16、K2048、C12288、32个index head、head dim 128、page 128，稳态 `request_state=-1`；source pool宽度默认66944，稳定prefix为65536，实际KV长度65664。tail按 `C + source - prefix` 直接映射，不驻留在prefix pool。
 
-本轮是部署配置对照：迁移版构建使用 vector 后处理且 SIMT=0；原版库的实际构建变体默认为 unknown，必须由来源 manifest 或实机确认。若核实为SIMT=1，则构建策略与迁移版不同；结果表示当前待测部署组合，不代表保持 kernel 构建参数相同后的单变量性能差异。revision与库哈希以preflight/runner manifest为准。
+本轮是部署配置对照。实际路径以每个case的 `backend_versions.sglang_backend`、编译变体、OPP manifest和已解析动态库为准，不能从分支名推断。历史direct版本使用vector后处理；新original版本通过正常SGLang接口调用固定原版LIM OPP。原版库的实际构建变体未知时保留unknown；配置未对齐时不能把差额全部归于迁移算法。两个原版OPP vendor在同一进程中还可能共享device-op路由；已解析host DSO不等于已证明每项使用独立device binary。
 
 ## 正确性与输入哈希
 
