@@ -108,6 +108,40 @@ SGL_KERNEL_A5_C8_PREBUILT="$ORIGINAL_BUILD" bash build.sh -a kernels Ascend950
 才运行 `benchmark/lim_a5_mtp_ab/build_original.sh`。不要将reference vendor
 `a5limbaseline_transformer` 的目录作为生产vendor `sglc8original_transformer` 的prebuilt。
 
+## 独立reference的Ninja时间戳错误
+
+若主wheel步骤成功，尾段`original/prepared/source/csrc/build`报
+`manifest 'build.ninja' still dirty after 100 tries`，并出现Makefile未来165秒提示，
+保留当前wheel和失败日志。调用顺序为主wheel→私有安装→独立reference；
+reference失败无需重新构建整套kernel。
+
+使用`benchmark/lim_a5_mtp_ab/retry_reference_local.sh`组合恢复环境。它检查主wheel
+成功退出码、wheel SHA256与私有安装文件、生产OPP哈希，再仅恢复reference。
+新输出根要求本地文件系统，实测写入mtime与当前时间差不超过2秒。
+需重建时，CMake/Ninja工具也安装在本地新环境，避免继续使用共享盘工具模块。
+不改变系统时间、原OPP源码、生产wheel或DeepEP。
+
+```bash
+KERNEL=/mnt/share/wzy/a5-lim-original-1030/sgl-kernel-npu
+OLD=/mnt/share/wzy/a5-lim-original-1030/build-pyheader-20261031-065052
+LOCAL=/tmp/wzy-a5-reference-$(date +%Y%m%d-%H%M%S)
+
+bash "$KERNEL/benchmark/lim_a5_mtp_ab/retry_reference_local.sh" "$OLD" "$LOCAL" \
+  --python /usr/local/python3.12.13/bin/python3 \
+  --ascend-env /usr/local/Ascend/ascend-toolkit/set_env.sh
+source "$LOCAL/session.env"
+```
+
+如果已找到此前完整的标准`build_original.sh`输出，可在上述命令追加
+`--reference-root /实际旧reference根`。脚本会校验固定源码、安装文件、binding哈希和
+当前torch/torch-npu版本后复用，跳过本地工具安装及OPP编译；验证失败明确退出。
+旧`recover_private.sh`生成的不完整回执不属于此标准复用入口。
+
+新建容器不保证旧reference仍在；此前A/B测出original耗时仅说明旧环境里跑过。
+旧文件需要位于当前可见挂载中，才能复用。新目录的`retry-reference.log`、
+`retry-reference.exitcode`、`wheel-install-proof.json`和`session.env`记录恢复状态。
+本地目录后续测试仍会引用，测试结束前保留它。
+
 ## 先确认实际加载路径
 
 ```bash
