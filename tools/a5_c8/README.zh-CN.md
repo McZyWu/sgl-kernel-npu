@@ -85,6 +85,29 @@ python3 tools/a5_c8/record_install.py --build-root "$ORIGINAL_BUILD" &&
 SGL_KERNEL_A5_C8_PREBUILT="$ORIGINAL_BUILD" bash build.sh -a kernels Ascend950
 ```
 
+## 私有构建在桥接文件报 Python.h 缺失
+
+若 `build/sglang_source/csrc/a5_c8_original.cpp` 的 include 栈为
+`torch/extension.h -> torch/csrc/python_headers.h -> Python.h`，需要更新本分支。
+桥接使用 ATen 和 dispatcher，未使用 Python 扩展绑定；修复删除了多余的
+`torch/extension.h`，没有修改原版算子算法、ABI 或 DeepEP。
+
+2026-10-31 在217验证：不添加 Python include 路径，旧文件复现失败；修复后桥接及
+原版 `NPUBridge.cpp`、`NPUStorageImpl.cpp` 三个文件编译退出0，使用
+`--no-undefined` 链接共享库退出0，依赖清单不含 `Python.h`，无直接 `Py*` 符号依赖。
+这是CPU编译/链接验证，尚不代表完整wheel或A5执行验收。
+
+`build_private.sh` 不接受已存在的输出目录。更新源clone后，应使用新输出目录；
+原失败目录的 `sglang_source` 是独立副本，更新外层clone不会自动修改它。
+若原生产OPP目录 `build/sglang_source/output/a5-c8-original-实际时间-PID/`
+的 `exit_code` 为0，且安装清单完整，可以将该目录设为
+`SGL_KERNEL_A5_C8_PREBUILT`，再运行 `build_private.sh /新的绝对输出目录`。
+脚本会重新校验来源及安装文件哈希，kernel wheel仍重新编译。
+
+此时独立reference OPP通常还未构建：`build_private.sh` 在主wheel成功并私有安装后
+才运行 `benchmark/lim_a5_mtp_ab/build_original.sh`。不要将reference vendor
+`a5limbaseline_transformer` 的目录作为生产vendor `sglc8original_transformer` 的prebuilt。
+
 ## 先确认实际加载路径
 
 ```bash

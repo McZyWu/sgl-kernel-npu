@@ -4,7 +4,6 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <string>
-#include <torch/extension.h>
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/core/npu/NPUGuard.h>
